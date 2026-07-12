@@ -4,9 +4,14 @@ The OpenClaw ``squilla-router`` plugin is a thin client — it POSTs the message
 text and gets an abstract tier back. This service embeds the message (external
 OpenAI-compatible embeddings endpoint), classifies it against the tier anchor
 prompts, runs the confidence gate and flag upgrades, records a plaintext-free
-decision trail keyed by decisionId, and accepts feedback for later
-self-learning. Stdlib only — copy this directory to any box with Python 3.11+
-and run it; no pip install.
+decision trail keyed by decisionId in MySQL, and accepts feedback for later
+self-learning. Stdlib plus PyMySQL — ``pip install PyMySQL`` on the box.
+
+Generic wire contract: the client depends ONLY on ``tier`` (an abstract
+capability tier ``c0``-``c3``, cheap->strong, that the client maps to a model)
+plus ``decisionId``. Everything algorithm-specific rides under opaque ``meta``,
+which the client logs but never parses. So the classifier below can be swapped
+for any other implementation with no client change — see the upgrade seam.
 
 Privacy contract: message text exists only in the request; it is never written
 to the store. The ``decisions`` schema has no text column — only derived data
@@ -16,18 +21,20 @@ client logs it next to its own transcript, which is where the plaintext lives.
 
 Upgrade seam: ``classify_semantic`` is the single classification entry point.
 To switch from zero-training anchor similarity to OpenSquilla's trained V4
-pipeline, replace its body with a ``V4Phase3Strategy.classify`` call — the
-store, trail, endpoints, and wire contract all stay as they are.
+pipeline (or any other router), replace its body — the store, trail, endpoints,
+and wire contract all stay as they are, as long as it returns ``final_tier``.
 
 Run:
     SQUILLA_EMBEDDINGS_URL=http://ml-box:8080/v1/embeddings \
+    SQUILLA_MYSQL_HOST=db-box SQUILLA_MYSQL_USER=squilla \
+    SQUILLA_MYSQL_PASSWORD=... SQUILLA_MYSQL_DATABASE=squilla_central \
     SQUILLA_CENTRAL_TOKEN=<token> \
     python3 services/squilla_central/server.py --host 0.0.0.0 --port 8710
 
 Wire contract (mirrored by the OpenClaw plugin's central-client.ts):
     POST /v1/route      {tenantId, sessionKey, message, attachmentCount}
-                        -> {decisionId, tier, routeClass, band, confidence,
-                            flags, flagUpgraded, policyVersion}
+                        -> {decisionId, tier, confidence, policyVersion,
+                            meta: {...algorithm-specific, opaque to client}}
     POST /v1/feedback   {decisionId, rating: up|down|neutral}
     GET  /v1/decisions/{id} | /v1/decisions?tenantId&sessionKey&limit
     GET  /v1/stats?tenantId
@@ -42,7 +49,6 @@ import json
 import math
 import os
 import re
-import sqlite3
 import threading
 import time
 import urllib.error
@@ -138,7 +144,11 @@ DEBUG_KEYWORDS = [
     "error", "bug", "exception", "traceback", "failed", "root cause",
     "报错", "根因", "修复",
 ]
-DEBUG_PATTERNS = [re.compile(r"Traceback \(most recent"), re.compile(r"stderr:"), re.compile(r"FAILED")]
+DEBUG_PATTERNS = [
+    re.compile(r"Traceback \(most recent"),
+    re.compile(r"stderr:"),
+    re.compile(r"FAILED"),
+]
 REPO_ARCH_KEYWORDS = [
     "repo", "codebase", "monorepo", "architecture", "重构", "架构", "module",
     "dependency",
@@ -280,9 +290,10 @@ def classify_semantic(
     gated_tier = gate["default_tier"] if confidence < gate["confidence_threshold"] else base_tier
     flags = compute_flags(message)
     final_tier = apply_flag_upgrades(gated_tier, flags)
+    ranked_anchor_idx = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)
     top_anchors = [
         {"text": anchor_texts[i], "similarity": sims[i]}
-        for i in sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:TOP_ANCHORS_REPORTED]
+        for i in ranked_anchor_idx[:TOP_ANCHORS_REPORTED]
     ]
     return {
         "band": "semantic",
@@ -354,37 +365,41 @@ def embed_texts(config: EmbeddingsConfig, texts: list[str]) -> list[list[float]]
 
 
 # ---------------------------------------------------------------------------
-# Store (sqlite3; NO plaintext column by design)
+# Store (MySQL via PyMySQL; NO plaintext column by design)
 # ---------------------------------------------------------------------------
 
-_SCHEMA = """
+# MySQL DDL. utf8mb4 so CJK anchors/tenant ids round-trip; JSON blobs live in
+# LONGTEXT (portable across MySQL 5.7/8 and MariaDB, and the embedding vector
+# can be large). Placeholders below are DB-API "%s" (PyMySQL), not "?".
+_DDL_DECISIONS = """
 CREATE TABLE IF NOT EXISTS decisions (
-  decision_id TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL,
-  session_key TEXT NOT NULL,
-  ts_ms INTEGER NOT NULL,
-  band TEXT NOT NULL,
-  base_tier TEXT NOT NULL,
-  gated_tier TEXT NOT NULL,
-  final_tier TEXT NOT NULL,
-  confidence REAL NOT NULL,
-  margin REAL NOT NULL,
-  probabilities TEXT NOT NULL,
-  flags TEXT NOT NULL,
-  char_len INTEGER NOT NULL,
-  attachment_count INTEGER NOT NULL,
-  top_anchors TEXT NOT NULL,
-  policy_version TEXT NOT NULL,
-  latency_ms INTEGER NOT NULL,
-  embedding TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_decisions_session
-  ON decisions (tenant_id, session_key, ts_ms);
+  decision_id VARCHAR(64) NOT NULL PRIMARY KEY,
+  tenant_id VARCHAR(191) NOT NULL,
+  session_key VARCHAR(191) NOT NULL,
+  ts_ms BIGINT NOT NULL,
+  band VARCHAR(32) NOT NULL,
+  base_tier VARCHAR(8) NOT NULL,
+  gated_tier VARCHAR(8) NOT NULL,
+  final_tier VARCHAR(8) NOT NULL,
+  confidence DOUBLE NOT NULL,
+  margin DOUBLE NOT NULL,
+  probabilities LONGTEXT NOT NULL,
+  flags LONGTEXT NOT NULL,
+  char_len INT NOT NULL,
+  attachment_count INT NOT NULL,
+  top_anchors LONGTEXT NOT NULL,
+  policy_version VARCHAR(64) NOT NULL,
+  latency_ms INT NOT NULL,
+  embedding LONGTEXT NULL,
+  INDEX idx_decisions_session (tenant_id, session_key, ts_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+_DDL_FEEDBACK = """
 CREATE TABLE IF NOT EXISTS feedback (
-  decision_id TEXT PRIMARY KEY,
-  rating TEXT NOT NULL,
-  ts_ms INTEGER NOT NULL
-);
+  decision_id VARCHAR(64) NOT NULL PRIMARY KEY,
+  rating VARCHAR(16) NOT NULL,
+  ts_ms BIGINT NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
 _SUMMARY_COLUMNS = (
@@ -394,18 +409,57 @@ _SUMMARY_COLUMNS = (
 )
 
 
-class CentralStore:
-    def __init__(self, path: str) -> None:
-        self._db = sqlite3.connect(path, check_same_thread=False)
+@dataclass
+class MySqlConfig:
+    host: str = "127.0.0.1"
+    port: int = 3306
+    user: str = "root"
+    password: str = ""
+    database: str = "squilla_central"
+
+
+class MySqlStore:
+    """Per-tenant decision + feedback store on MySQL.
+
+    A single connection guarded by a lock (the service is low-QPS and every op
+    is short); ``ping(reconnect=True)`` before each op survives MySQL's
+    ``wait_timeout``. PyMySQL is imported lazily so this module stays importable
+    (for tests using a fake store) on hosts without the driver.
+    """
+
+    def __init__(self, config: MySqlConfig) -> None:
+        import pymysql  # lazy: only the deployed service needs the driver
+
+        self._pymysql = pymysql
+        self._config = config
         self._lock = threading.Lock()
+        self._conn = self._connect()
         with self._lock:
-            self._db.executescript(_SCHEMA)
+            with self._conn.cursor() as cursor:
+                cursor.execute(_DDL_DECISIONS)
+                cursor.execute(_DDL_FEEDBACK)
+            self._conn.commit()
+
+    def _connect(self):
+        return self._pymysql.connect(
+            host=self._config.host,
+            port=self._config.port,
+            user=self._config.user,
+            password=self._config.password,
+            database=self._config.database,
+            charset="utf8mb4",
+            autocommit=False,
+        )
+
+    def _cursor(self):
+        self._conn.ping(reconnect=True)
+        return self._conn.cursor()
 
     def insert_decision(self, record: dict[str, Any]) -> None:
-        with self._lock:
-            self._db.execute(
+        with self._lock, self._cursor() as cursor:
+            cursor.execute(
                 "INSERT INTO decisions VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     record["decisionId"],
                     record["tenantId"],
@@ -427,7 +481,7 @@ class CentralStore:
                     json.dumps(record["embedding"]) if record["embedding"] is not None else None,
                 ),
             )
-            self._db.commit()
+            self._conn.commit()
 
     def _summary(self, row: tuple, rating: str | None) -> dict[str, Any]:
         return {
@@ -451,81 +505,82 @@ class CentralStore:
             "rating": rating,
         }
 
-    def _rating(self, decision_id: str) -> str | None:
-        row = self._db.execute(
-            "SELECT rating FROM feedback WHERE decision_id = ?", (decision_id,)
-        ).fetchone()
+    def _rating(self, cursor, decision_id: str) -> str | None:
+        cursor.execute("SELECT rating FROM feedback WHERE decision_id = %s", (decision_id,))
+        row = cursor.fetchone()
         return row[0] if row else None
 
     def get_decision(self, decision_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._db.execute(
-                f"SELECT {_SUMMARY_COLUMNS} FROM decisions WHERE decision_id = ?",
+        with self._lock, self._cursor() as cursor:
+            cursor.execute(
+                f"SELECT {_SUMMARY_COLUMNS} FROM decisions WHERE decision_id = %s",
                 (decision_id,),
-            ).fetchone()
+            )
+            row = cursor.fetchone()
             if row is None:
                 return None
-            return self._summary(row, self._rating(decision_id))
+            return self._summary(row, self._rating(cursor, decision_id))
 
     def list_decisions(
         self, tenant_id: str, session_key: str | None, limit: int
     ) -> list[dict[str, Any]]:
-        with self._lock:
+        with self._lock, self._cursor() as cursor:
             if session_key:
-                rows = self._db.execute(
+                cursor.execute(
                     f"SELECT {_SUMMARY_COLUMNS} FROM decisions "
-                    "WHERE tenant_id = ? AND session_key = ? ORDER BY ts_ms DESC LIMIT ?",
+                    "WHERE tenant_id = %s AND session_key = %s ORDER BY ts_ms DESC LIMIT %s",
                     (tenant_id, session_key, limit),
-                ).fetchall()
+                )
             else:
-                rows = self._db.execute(
+                cursor.execute(
                     f"SELECT {_SUMMARY_COLUMNS} FROM decisions "
-                    "WHERE tenant_id = ? ORDER BY ts_ms DESC LIMIT ?",
+                    "WHERE tenant_id = %s ORDER BY ts_ms DESC LIMIT %s",
                     (tenant_id, limit),
-                ).fetchall()
-            return [self._summary(row, self._rating(row[0])) for row in rows]
+                )
+            rows = cursor.fetchall()
+            return [self._summary(row, self._rating(cursor, row[0])) for row in rows]
 
     def record_feedback(self, decision_id: str, rating: str, ts_ms: int) -> bool:
-        with self._lock:
-            exists = self._db.execute(
-                "SELECT 1 FROM decisions WHERE decision_id = ?", (decision_id,)
-            ).fetchone()
-            if not exists:
+        with self._lock, self._cursor() as cursor:
+            cursor.execute("SELECT 1 FROM decisions WHERE decision_id = %s", (decision_id,))
+            if cursor.fetchone() is None:
                 return False
-            self._db.execute(
-                "INSERT INTO feedback (decision_id, rating, ts_ms) VALUES (?, ?, ?) "
-                "ON CONFLICT(decision_id) DO UPDATE SET rating = excluded.rating, "
-                "ts_ms = excluded.ts_ms",
+            cursor.execute(
+                "INSERT INTO feedback (decision_id, rating, ts_ms) VALUES (%s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE rating = VALUES(rating), ts_ms = VALUES(ts_ms)",
                 (decision_id, rating, ts_ms),
             )
-            self._db.commit()
+            self._conn.commit()
             return True
 
     def stats(self, tenant_id: str) -> dict[str, Any]:
-        with self._lock:
-            tiers = self._db.execute(
-                "SELECT final_tier, COUNT(*) FROM decisions WHERE tenant_id = ? "
+        with self._lock, self._cursor() as cursor:
+            cursor.execute(
+                "SELECT final_tier, COUNT(*) FROM decisions WHERE tenant_id = %s "
                 "GROUP BY final_tier",
                 (tenant_id,),
-            ).fetchall()
-            bands = self._db.execute(
-                "SELECT band, COUNT(*) FROM decisions WHERE tenant_id = ? GROUP BY band",
+            )
+            tiers = cursor.fetchall()
+            cursor.execute(
+                "SELECT band, COUNT(*) FROM decisions WHERE tenant_id = %s GROUP BY band",
                 (tenant_id,),
-            ).fetchall()
-            ratings = self._db.execute(
+            )
+            bands = cursor.fetchall()
+            cursor.execute(
                 "SELECT f.rating, COUNT(*) FROM feedback f "
                 "JOIN decisions d ON d.decision_id = f.decision_id "
-                "WHERE d.tenant_id = ? GROUP BY f.rating",
+                "WHERE d.tenant_id = %s GROUP BY f.rating",
                 (tenant_id,),
-            ).fetchall()
+            )
+            ratings = cursor.fetchall()
         return {
-            "tiers": dict(tiers),
-            "bands": dict(bands),
-            "ratings": dict(ratings),
+            "tiers": {row[0]: row[1] for row in tiers},
+            "bands": {row[0]: row[1] for row in bands},
+            "ratings": {row[0]: row[1] for row in ratings},
         }
 
     def close(self) -> None:
-        self._db.close()
+        self._conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +592,7 @@ class Central:
     def __init__(
         self,
         *,
-        store: CentralStore,
+        store: Any,  # any object with the MySqlStore method surface (tests inject a fake)
         embeddings: EmbeddingsConfig,
         default_tier: str = "c1",
         confidence_threshold: float = 0.5,
@@ -661,15 +716,22 @@ class Central:
         }
         self.store.insert_decision(record)
         final_tier = outcome["final_tier"]
+        # Generic wire response: `tier` (the abstract c0-c3 capability tier the
+        # client maps to a model) + confidence are the only contract; everything
+        # algorithm-specific goes under opaque `meta`, which the client logs but
+        # never branches on. Swapping the classifier keeps this shape unchanged.
         return 200, {
             "decisionId": record["decisionId"],
             "tier": final_tier,
-            "routeClass": ROUTE_CLASSES[TEXT_TIERS.index(final_tier)],
-            "band": outcome["band"],
             "confidence": outcome["confidence"],
-            "flags": outcome["flags"],
-            "flagUpgraded": outcome["flag_upgraded"],
             "policyVersion": self.policy_version,
+            "meta": {
+                "routeClass": ROUTE_CLASSES[TEXT_TIERS.index(final_tier)],
+                "band": outcome["band"],
+                "flags": outcome["flags"],
+                "flagUpgraded": outcome["flag_upgraded"],
+                "margin": outcome["margin"],
+            },
         }
 
     def _feedback(self, body: Any) -> tuple[int, dict[str, Any]]:
@@ -749,7 +811,15 @@ def main(argv: list[str] | None = None) -> None:
     if not embeddings_url:
         raise SystemExit("SQUILLA_EMBEDDINGS_URL is required")
     central = Central(
-        store=CentralStore(os.environ.get("SQUILLA_DB_PATH", "squilla-central.sqlite")),
+        store=MySqlStore(
+            MySqlConfig(
+                host=os.environ.get("SQUILLA_MYSQL_HOST", "127.0.0.1"),
+                port=int(os.environ.get("SQUILLA_MYSQL_PORT", "3306")),
+                user=os.environ.get("SQUILLA_MYSQL_USER", "root"),
+                password=os.environ.get("SQUILLA_MYSQL_PASSWORD", ""),
+                database=os.environ.get("SQUILLA_MYSQL_DATABASE", "squilla_central"),
+            )
+        ),
         embeddings=EmbeddingsConfig(
             url=embeddings_url,
             model=os.environ.get("SQUILLA_EMBEDDINGS_MODEL", "bge-small-zh-v1.5"),
