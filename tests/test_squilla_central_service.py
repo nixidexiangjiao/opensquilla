@@ -66,7 +66,12 @@ class FakeStore:
         for did, rating in self.ratings.items():
             if did in self.decisions and self.decisions[did]["tenantId"] == tenant_id:
                 ratings[rating] = ratings.get(rating, 0) + 1
-        return {"tiers": counts("finalTier"), "bands": counts("band"), "ratings": ratings}
+        return {
+            "tiers": counts("finalTier"),
+            "bands": counts("band"),
+            "profiles": counts("profile"),
+            "ratings": ratings,
+        }
 
 TIER_AXIS = {
     "c0": [1.0, 0.0, 0.0, 0.0],
@@ -103,7 +108,13 @@ def make_central(embed_fn=embed_stub, token=None) -> Central:
 
 
 def route_body(message: str) -> dict:
-    return {"tenantId": "t1", "sessionKey": "s1", "message": message, "attachmentCount": 0}
+    return {
+        "tenantId": "t1",
+        "sessionKey": "s1",
+        "profile": "squilla/auto",
+        "message": message,
+        "attachmentCount": 0,
+    }
 
 
 def test_routes_semantically_and_stores_no_plaintext():
@@ -117,6 +128,7 @@ def test_routes_semantically_and_stores_no_plaintext():
     stored = central.store.get_decision(body["decisionId"])
     assert stored["baseTier"] == "c3"
     assert stored["finalTier"] == "c3"
+    assert stored["profile"] == "squilla/auto"
     assert stored["charLen"] == len(message)
     assert stored["policyVersion"] == "test-v1"
     assert len(stored["topAnchors"]) > 0
@@ -177,6 +189,7 @@ def test_trace_endpoints_feedback_and_stats():
 
     status, stats = central.handle("GET", "/v1/stats", {"tenantId": ["t1"]}, None, None)
     assert stats["tiers"] == {"c2": 1}
+    assert stats["profiles"] == {"squilla/auto": 1}
     assert stats["ratings"] == {"down": 1}
 
 
@@ -271,6 +284,7 @@ def _decision_record(decision_id="d-1", tenant="t1", final="c2", band="semantic"
         "decisionId": decision_id,
         "tenantId": tenant,
         "sessionKey": "s1",
+        "profile": "squilla/auto",
         "tsMs": 1000,
         "band": band,
         "baseTier": "c0",
@@ -304,20 +318,21 @@ def test_mysqlstore_insert_placeholder_and_param_order(monkeypatch):
     store.insert_decision(_decision_record())
     insert = next(c for c in conn.calls if c[0].startswith("INSERT INTO decisions"))
     sql, params = insert
-    assert sql.count("%s") == 18
-    assert len(params) == 18
+    assert sql.count("%s") == 19
+    assert len(params) == 19
     assert params[0] == "d-1"  # decision_id first
-    assert json.loads(params[10]) == {"c0": 0.7, "c1": 0.1, "c2": 0.15, "c3": 0.05}
-    assert json.loads(params[17]) == [0.1, 0.2]  # embedding last
+    assert params[3] == "squilla/auto"  # profile after session_key
+    assert json.loads(params[11]) == {"c0": 0.7, "c1": 0.1, "c2": 0.15, "c3": 0.05}
+    assert json.loads(params[18]) == [0.1, 0.2]  # embedding last
     assert conn.committed == 1
 
 
 def test_mysqlstore_get_maps_row_to_summary(monkeypatch):
     conn = _FakeConn()
     store = _make_store(monkeypatch, conn)
-    # 17 summary columns in _SUMMARY_COLUMNS order, then the rating lookup row.
+    # 18 summary columns in _SUMMARY_COLUMNS order, then the rating lookup row.
     row = (
-        "d-1", "t1", "s1", 1000, "semantic", "c0", "c0", "c2", 0.9, 0.4,
+        "d-1", "t1", "s1", "squilla/auto", 1000, "semantic", "c0", "c0", "c2", 0.9, 0.4,
         json.dumps({"c0": 0.7, "c1": 0.1, "c2": 0.15, "c3": 0.05}),
         json.dumps({"highRisk": True}), 12, 0,
         json.dumps([{"text": "谢谢", "similarity": 0.8}]), "v1", 5,
@@ -325,6 +340,7 @@ def test_mysqlstore_get_maps_row_to_summary(monkeypatch):
     conn.results = [row, ("down",)]
     summary = store.get_decision("d-1")
     assert summary["decisionId"] == "d-1"
+    assert summary["profile"] == "squilla/auto"
     assert summary["finalTier"] == "c2"
     assert summary["probabilities"]["c0"] == 0.7
     assert summary["flags"] == {"highRisk": True}
@@ -360,10 +376,12 @@ def test_mysqlstore_stats_aggregates(monkeypatch):
     conn.results = [
         [("c2", 3), ("c0", 1)],  # tiers
         [("semantic", 4)],  # bands
+        [("squilla/auto", 4)],  # profiles
         [("down", 2)],  # ratings
     ]
     assert store.stats("t1") == {
         "tiers": {"c2": 3, "c0": 1},
         "bands": {"semantic": 4},
+        "profiles": {"squilla/auto": 4},
         "ratings": {"down": 2},
     }

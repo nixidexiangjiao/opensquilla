@@ -32,7 +32,7 @@ Run:
     python3 services/squilla_central/server.py --host 0.0.0.0 --port 8710
 
 Wire contract (mirrored by the OpenClaw plugin's central-client.ts):
-    POST /v1/route      {tenantId, sessionKey, message, attachmentCount}
+    POST /v1/route      {tenantId, sessionKey, profile?, message, attachmentCount}
                         -> {decisionId, tier, confidence, policyVersion,
                             meta: {...algorithm-specific, opaque to client}}
     POST /v1/feedback   {decisionId, rating: up|down|neutral}
@@ -376,6 +376,7 @@ CREATE TABLE IF NOT EXISTS decisions (
   decision_id VARCHAR(64) NOT NULL PRIMARY KEY,
   tenant_id VARCHAR(191) NOT NULL,
   session_key VARCHAR(191) NOT NULL,
+  profile VARCHAR(191) NOT NULL DEFAULT '',
   ts_ms BIGINT NOT NULL,
   band VARCHAR(32) NOT NULL,
   base_tier VARCHAR(8) NOT NULL,
@@ -403,7 +404,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 """
 
 _SUMMARY_COLUMNS = (
-    "decision_id, tenant_id, session_key, ts_ms, band, base_tier, gated_tier, "
+    "decision_id, tenant_id, session_key, profile, ts_ms, band, base_tier, gated_tier, "
     "final_tier, confidence, margin, probabilities, flags, char_len, "
     "attachment_count, top_anchors, policy_version, latency_ms"
 )
@@ -459,11 +460,12 @@ class MySqlStore:
         with self._lock, self._cursor() as cursor:
             cursor.execute(
                 "INSERT INTO decisions VALUES "
-                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     record["decisionId"],
                     record["tenantId"],
                     record["sessionKey"],
+                    record["profile"],
                     record["tsMs"],
                     record["band"],
                     record["baseTier"],
@@ -488,20 +490,21 @@ class MySqlStore:
             "decisionId": row[0],
             "tenantId": row[1],
             "sessionKey": row[2],
-            "tsMs": row[3],
-            "band": row[4],
-            "baseTier": row[5],
-            "gatedTier": row[6],
-            "finalTier": row[7],
-            "confidence": row[8],
-            "margin": row[9],
-            "probabilities": json.loads(row[10]),
-            "flags": json.loads(row[11]),
-            "charLen": row[12],
-            "attachmentCount": row[13],
-            "topAnchors": json.loads(row[14]),
-            "policyVersion": row[15],
-            "latencyMs": row[16],
+            "profile": row[3],
+            "tsMs": row[4],
+            "band": row[5],
+            "baseTier": row[6],
+            "gatedTier": row[7],
+            "finalTier": row[8],
+            "confidence": row[9],
+            "margin": row[10],
+            "probabilities": json.loads(row[11]),
+            "flags": json.loads(row[12]),
+            "charLen": row[13],
+            "attachmentCount": row[14],
+            "topAnchors": json.loads(row[15]),
+            "policyVersion": row[16],
+            "latencyMs": row[17],
             "rating": rating,
         }
 
@@ -567,6 +570,11 @@ class MySqlStore:
             )
             bands = cursor.fetchall()
             cursor.execute(
+                "SELECT profile, COUNT(*) FROM decisions WHERE tenant_id = %s GROUP BY profile",
+                (tenant_id,),
+            )
+            profiles = cursor.fetchall()
+            cursor.execute(
                 "SELECT f.rating, COUNT(*) FROM feedback f "
                 "JOIN decisions d ON d.decision_id = f.decision_id "
                 "WHERE d.tenant_id = %s GROUP BY f.rating",
@@ -576,6 +584,7 @@ class MySqlStore:
         return {
             "tiers": {row[0]: row[1] for row in tiers},
             "bands": {row[0]: row[1] for row in bands},
+            "profiles": {row[0]: row[1] for row in profiles},
             "ratings": {row[0]: row[1] for row in ratings},
         }
 
@@ -673,6 +682,10 @@ class Central:
         if len(message) > MAX_MESSAGE_CHARS:
             return 413, {"error": "message too large"}
         session_key = body.get("sessionKey") if isinstance(body.get("sessionKey"), str) else ""
+        # Which client-side routing profile (virtual model id) triggered this
+        # turn. Free-form string: keeps the wire contract generic while letting
+        # stats and future policy key on it.
+        profile = body.get("profile") if isinstance(body.get("profile"), str) else ""
         raw_attachments = body.get("attachmentCount")
         attachment_count = (
             int(raw_attachments)
@@ -698,6 +711,7 @@ class Central:
             "decisionId": str(uuid.uuid4()),
             "tenantId": tenant_id,
             "sessionKey": session_key,
+            "profile": profile,
             "tsMs": started,
             "band": outcome["band"],
             "baseTier": outcome["base_tier"],
