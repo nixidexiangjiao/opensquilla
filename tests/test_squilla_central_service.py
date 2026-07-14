@@ -7,13 +7,9 @@ import sys
 import types
 
 from services.squilla_central.server import (
-    TEXT_TIERS,
-    TIER_ANCHOR_TEXTS,
     Central,
-    EmbeddingsConfig,
     MySqlConfig,
     MySqlStore,
-    flat_anchor_texts,
 )
 
 
@@ -73,36 +69,42 @@ class FakeStore:
             "ratings": ratings,
         }
 
-TIER_AXIS = {
-    "c0": [1.0, 0.0, 0.0, 0.0],
-    "c1": [0.0, 1.0, 0.0, 0.0],
-    "c2": [0.0, 0.0, 1.0, 0.0],
-    "c3": [0.0, 0.0, 0.0, 1.0],
-}
+
+class FakeClassifier:
+    """Stand-in for V4Classifier (the real model needs the LFS bundle + ML deps,
+    verified only on deploy). Returns a deterministic V4-shaped outcome so the
+    central wiring — outcome -> trail -> generic wire response -> stats — is
+    fully covered here. It ignores the message, which also proves no plaintext
+    reaches the store."""
+
+    def __init__(self, tier: str = "c2", route_class: str = "R2") -> None:
+        self.tier = tier
+        self.route_class = route_class
+
+    def classify(self, message: str) -> dict:  # noqa: ARG002 - message intentionally unused
+        return {
+            "band": "v4",
+            "base_tier": self.tier,
+            "gated_tier": self.tier,
+            "final_tier": self.tier,
+            "confidence": 0.77,
+            "margin": 0.3,
+            "probabilities": {"c0": 0.05, "c1": 0.1, "c2": 0.6, "c3": 0.25},
+            "flags": {"highRisk": True},
+            "flag_upgraded": False,
+            "top_anchors": [],
+            "embedding": None,
+            "route_class": self.route_class,
+            "difficulty": 0.42,
+        }
 
 
-def _axis_for(text: str) -> list[float]:
-    for tier in TEXT_TIERS:
-        if text.startswith(f"{tier}:") or text in TIER_ANCHOR_TEXTS[tier]:
-            return list(TIER_AXIS[tier])
-    return [0.5, 0.5, 0.5, 0.5]
-
-
-def embed_stub(_config, texts):
-    return [_axis_for(text) for text in texts]
-
-
-def embed_fail(_config, _texts):
-    return None
-
-
-def make_central(embed_fn=embed_stub, token=None) -> Central:
+def make_central(classifier=None, token=None) -> Central:
     return Central(
         store=FakeStore(),
-        embeddings=EmbeddingsConfig(url="http://stub"),
+        classifier=FakeClassifier() if classifier is None else classifier,
         policy_version="test-v1",
         token=token,
-        embed_fn=embed_fn,
         now_ms=lambda: 1000,
     )
 
@@ -117,26 +119,29 @@ def route_body(message: str) -> dict:
     }
 
 
-def test_routes_semantically_and_stores_no_plaintext():
-    central = make_central()
-    message = "c3:设计一个跨区域容灾架构-SECRET-PAYLOAD"
-    status, body = central.handle("POST", "/v1/route", {}, route_body(message), None)
+def test_routes_via_v4_classifier_and_stores_no_plaintext():
+    central = make_central(classifier=FakeClassifier(tier="c3", route_class="R3"))
+    status, body = central.handle(
+        "POST", "/v1/route", {}, route_body("设计一个跨区域容灾架构-SECRET-PAYLOAD"), None
+    )
     assert status == 200
     assert body["tier"] == "c3"
-    assert body["meta"]["band"] == "semantic"
+    assert body["meta"]["band"] == "v4"
+    assert body["meta"]["routeClass"] == "R3"
+    assert body["meta"]["difficulty"] == 0.42
 
     stored = central.store.get_decision(body["decisionId"])
-    assert stored["baseTier"] == "c3"
     assert stored["finalTier"] == "c3"
     assert stored["profile"] == "squilla/auto"
-    assert stored["charLen"] == len(message)
     assert stored["policyVersion"] == "test-v1"
-    assert len(stored["topAnchors"]) > 0
     assert "SECRET-PAYLOAD" not in str(stored)
 
 
-def test_heuristic_fallback_when_embeddings_fail():
-    central = make_central(embed_fn=embed_fail)
+def test_heuristic_fallback_when_no_classifier():
+    # classifier=None models the V4 bundle/deps being unavailable at startup.
+    central = Central(
+        store=FakeStore(), classifier=None, policy_version="test-v1", now_ms=lambda: 1
+    )
     status, body = central.handle("POST", "/v1/route", {}, route_body("谢谢"), None)
     assert status == 200
     assert body["tier"] == "c0"
@@ -144,14 +149,26 @@ def test_heuristic_fallback_when_embeddings_fail():
     assert central.store.get_decision(body["decisionId"])["band"] == "short_plain"
 
 
-def test_flag_upgrades_apply_centrally():
-    central = make_central()
+def test_heuristic_flag_upgrade_when_no_classifier():
+    central = Central(
+        store=FakeStore(), classifier=None, policy_version="test-v1", now_ms=lambda: 1
+    )
     status, body = central.handle(
-        "POST", "/v1/route", {}, route_body("c0:把这个删除了直接部署到生产"), None
+        "POST", "/v1/route", {}, route_body("把这个删除了直接部署到生产"), None
     )
     assert status == 200
-    assert body["tier"] == "c2"
+    assert body["tier"] == "c2"  # short_plain c0 -> highRisk flag upgrade -> c2
     assert body["meta"]["flagUpgraded"] is True
+
+
+def test_healthz_reports_classifier():
+    assert make_central().handle("GET", "/healthz", {}, None, None)[1]["classifier"] == "v4"
+    assert (
+        Central(store=FakeStore(), classifier=None).handle("GET", "/healthz", {}, None, None)[1][
+            "classifier"
+        ]
+        == "heuristic"
+    )
 
 
 def test_validates_route_body():
@@ -163,8 +180,8 @@ def test_validates_route_body():
 
 
 def test_trace_endpoints_feedback_and_stats():
-    central = make_central()
-    _, routed = central.handle("POST", "/v1/route", {}, route_body("c2:查一下这个报错"), None)
+    central = make_central()  # FakeClassifier -> c2
+    _, routed = central.handle("POST", "/v1/route", {}, route_body("查一下这个报错"), None)
     decision_id = routed["decisionId"]
 
     status, detail = central.handle("GET", f"/v1/decisions/{decision_id}", {}, None, None)
@@ -211,14 +228,8 @@ def test_unknown_decision_and_bad_feedback():
 def test_bearer_token_required_on_v1_but_not_healthz():
     central = make_central(token="secret")
     assert central.handle("POST", "/v1/route", {}, route_body("hi"), None)[0] == 401
-    assert central.handle("POST", "/v1/route", {}, route_body("c0:hi"), "Bearer secret")[0] == 200
+    assert central.handle("POST", "/v1/route", {}, route_body("hi"), "Bearer secret")[0] == 200
     assert central.handle("GET", "/healthz", {}, None, None)[0] == 200
-
-
-def test_anchor_texts_flatten_in_tier_order():
-    texts = flat_anchor_texts()
-    assert texts[0] == TIER_ANCHOR_TEXTS["c0"][0]
-    assert texts[-1] == TIER_ANCHOR_TEXTS["c3"][-1]
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +396,4 @@ def test_mysqlstore_stats_aggregates(monkeypatch):
         "profiles": {"squilla/auto": 4},
         "ratings": {"down": 2},
     }
+

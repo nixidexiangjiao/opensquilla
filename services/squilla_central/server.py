@@ -1,11 +1,17 @@
 """Central SquillaRouter service: ALL routing intelligence lives here.
 
 The OpenClaw ``squilla-router`` plugin is a thin client — it POSTs the message
-text and gets an abstract tier back. This service embeds the message (external
-OpenAI-compatible embeddings endpoint), classifies it against the tier anchor
-prompts, runs the confidence gate and flag upgrades, records a plaintext-free
-decision trail keyed by decisionId in MySQL, and accepts feedback for later
-self-learning. Stdlib plus PyMySQL — ``pip install PyMySQL`` on the box.
+text and gets an abstract tier back. This service runs OpenSquilla's real V4
+Phase 3 model (the trained BGE-ONNX + LightGBM + MLP ensemble, via
+``V4Phase3Strategy``), records a plaintext-free decision trail keyed by
+decisionId in MySQL, and accepts feedback for later self-learning. If the V4
+model bundle or its ML deps are unavailable it degrades to the dependency-free
+band heuristic (``classify_heuristic``) so routing still answers.
+
+Deps: PyMySQL always; the V4 path additionally needs ``opensquilla[recommended]``
+(numpy / lightgbm / onnxruntime / scikit-learn / joblib) plus the Git-LFS model
+bundle under ``opensquilla/squilla_router/models/v4.2_phase3_inference`` (run
+``git lfs pull``). No external embeddings endpoint — BGE runs in-process (ONNX).
 
 Generic wire contract: the client depends ONLY on ``tier`` (an abstract
 capability tier ``c0``-``c3``, cheap->strong, that the client maps to a model)
@@ -19,17 +25,18 @@ to the store. The ``decisions`` schema has no text column — only derived data
 anchors, the embedding vector). Debugging correlates through decisionId: the
 client logs it next to its own transcript, which is where the plaintext lives.
 
-Upgrade seam: ``classify_semantic`` is the single classification entry point.
-To switch from zero-training anchor similarity to OpenSquilla's trained V4
-pipeline (or any other router), replace its body — the store, trail, endpoints,
-and wire contract all stay as they are, as long as it returns ``final_tier``.
+Classifier seam: the injected ``classifier`` is the single classification entry
+point (``V4Classifier`` in production, a fake in tests, ``None`` to force the
+heuristic). Swapping the router = swapping the classifier — the store, trail,
+endpoints, and wire contract all stay as they are, as long as it returns an
+outcome dict with ``final_tier``.
 
 Run:
-    SQUILLA_EMBEDDINGS_URL=http://ml-box:8080/v1/embeddings \
     SQUILLA_MYSQL_HOST=db-box SQUILLA_MYSQL_USER=squilla \
     SQUILLA_MYSQL_PASSWORD=... SQUILLA_MYSQL_DATABASE=squilla_central \
     SQUILLA_CENTRAL_TOKEN=<token> \
-    python3 services/squilla_central/server.py --host 0.0.0.0 --port 8710
+    PYTHONPATH=src python3 services/squilla_central/server.py --host 0.0.0.0 --port 8710
+    # SQUILLA_V4=0 forces the heuristic fallback (no ML deps / bundle needed).
 
 Wire contract (mirrored by the OpenClaw plugin's central-client.ts):
     POST /v1/route      {tenantId, sessionKey, profile?, message, attachmentCount}
@@ -44,15 +51,13 @@ Wire contract (mirrored by the OpenClaw plugin's central-client.ts):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hmac
 import json
-import math
 import os
 import re
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -61,70 +66,16 @@ from urllib.parse import parse_qs, urlparse
 
 TEXT_TIERS = ("c0", "c1", "c2", "c3")
 ROUTE_CLASSES = ("R0", "R1", "R2", "R3")
+# R0-R3 route classes map 1:1 onto the abstract c0-c3 tiers (OpenSquilla
+# router_tiers.ROUTE_CLASS_TO_TIER). Kept local so the service has no import-time
+# dependency on the opensquilla package (the V4 path imports it lazily).
+ROUTE_CLASS_TO_TIER = dict(zip(ROUTE_CLASSES, TEXT_TIERS))
 
 # ---------------------------------------------------------------------------
-# Anchors (must stay identical to extensions/squilla-router/semantic.ts so the
-# central service and any offline analysis agree on the anchor space).
+# Heuristic-fallback rule constants (OpenSquilla router.runtime.yaml /
+# heuristic.py parity; keep in sync with extensions/squilla-router/router.ts,
+# the plugin-side fallback). Used only when the V4 model is unavailable.
 # ---------------------------------------------------------------------------
-
-TIER_ANCHOR_TEXTS: dict[str, list[str]] = {
-    "c0": [
-        "谢谢",
-        "好的，收到",
-        "thanks, that works",
-        "ok sounds good",
-        "把这句话改得礼貌一点",
-        "这个词是什么意思",
-        "translate this sentence to English",
-        "今天是星期几",
-    ],
-    "c1": [
-        "帮我写一封请假邮件",
-        "这段代码是做什么的",
-        "给这个函数加上注释",
-        "对比一下这两个方案的优缺点",
-        "write a regex that matches email addresses",
-        "总结一下这篇文章的要点",
-        "how do I sort a list of objects in Python",
-        "帮我把这段介绍润色得更正式",
-    ],
-    "c2": [
-        "这个报错是什么原因，帮我修复",
-        "为什么这个测试在 CI 上失败，本地却能通过",
-        "帮我实现一个带重试和超时控制的下载函数",
-        "分析这段日志，找出请求变慢的根因",
-        "debug this stack trace and explain the root cause",
-        "设计这个功能的实现步骤并列出要改动的文件",
-        "这个内存泄漏应该怎么排查",
-        "refactor this module to remove the circular dependency",
-    ],
-    "c3": [
-        "设计一个跨区域容灾的部署架构",
-        "评估从单体迁移到微服务的方案和风险",
-        "怎么安全地把生产数据库迁移到新集群",
-        "design a multi-tenant authorization architecture",
-        "制定这个系统的分库分表和数据迁移方案",
-        "评估这两种一致性协议在我们场景下的取舍",
-        "规划一次零停机的大版本升级",
-        "audit this design for security and scalability risks",
-    ],
-}
-
-
-def flat_anchor_texts() -> list[str]:
-    return [text for tier in TEXT_TIERS for text in TIER_ANCHOR_TEXTS[tier]]
-
-
-# ---------------------------------------------------------------------------
-# Rule constants (OpenSquilla router.runtime.yaml / heuristic.py parity; keep
-# in sync with extensions/squilla-router/router.ts, the plugin-side fallback).
-# ---------------------------------------------------------------------------
-
-SCORE_TEMPERATURE = 0.05
-TOP_K_ANCHORS = 2
-TOP_ANCHORS_REPORTED = 3
-MARGIN_UPGRADE_THRESHOLD = 0.10
-UNDER_ROUTING_SAFETY_THRESHOLD = 0.45
 
 HEAVY_MIN_CHARS = 12_000
 HEAVY_MIN_FENCED_BLOCKS = 3
@@ -240,128 +191,60 @@ def classify_heuristic(message: str, attachment_count: int) -> dict[str, Any]:
     }
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
-    return dot / norm if norm > 0 else 0.0
+class V4Classifier:
+    """Central classifier backed by OpenSquilla's real V4 Phase 3 model.
 
+    Runs the trained BGE(ONNX) + LightGBM + MLP ensemble through
+    ``V4Phase3Strategy`` — the same inference core OpenSquilla uses in-process.
+    The opensquilla import and the heavy ML deps / LFS bundle are only touched
+    here (constructed at startup), so the module stays importable without them
+    and ``main`` degrades to ``classify_heuristic`` when this cannot be built.
 
-def _softmax(scores: list[float], temperature: float) -> list[float]:
-    scaled = [score / temperature for score in scores]
-    peak = max(scaled)
-    exps = [math.exp(value - peak) for value in scaled]
-    total = sum(exps)
-    return [value / total for value in exps]
-
-
-def classify_semantic(
-    message: str,
-    query_vector: list[float],
-    anchor_vectors: list[list[float]],
-    gate: dict[str, Any],
-) -> dict[str, Any]:
-    """Anchor-similarity classification + OpenSquilla postprocess + gate + flags.
-
-    This is the seam to swap for ``V4Phase3Strategy.classify`` later: return
-    the same dict shape and nothing else needs to change.
+    Only the current turn is fed: the store holds no plaintext history, so V4's
+    history channels (prev user/assistant text, route history) stay empty —
+    first-turn feature quality. KV-cache stickiness is handled client-side.
     """
-    anchor_texts = flat_anchor_texts()
-    sims = [_cosine(query_vector, anchor) for anchor in anchor_vectors]
-    tier_scores: list[float] = []
-    offset = 0
-    for tier in TEXT_TIERS:
-        count = len(TIER_ANCHOR_TEXTS[tier])
-        tier_sims = sorted(sims[offset : offset + count], reverse=True)[:TOP_K_ANCHORS]
-        tier_scores.append(sum(tier_sims) / len(tier_sims))
-        offset += count
-    probs = _softmax(tier_scores, SCORE_TEMPERATURE)
-    ranked = sorted(range(len(probs)), key=lambda i: probs[i], reverse=True)
-    confidence = probs[ranked[0]]
-    margin = probs[ranked[0]] - probs[ranked[1]]
-    tier_idx = ranked[0]
 
-    # OpenSquilla postprocess order: margin upgrade, then under-routing safety.
-    if margin < MARGIN_UPGRADE_THRESHOLD:
-        tier_idx = min(tier_idx + 1, len(TEXT_TIERS) - 1)
-    if tier_idx < 2 and probs[2] + probs[3] > UNDER_ROUTING_SAFETY_THRESHOLD:
-        tier_idx = 2
+    def __init__(self, bundle_dir: str | None = None, confidence_threshold: float = 0.5) -> None:
+        from opensquilla.squilla_router.v4_phase3 import V4Phase3Strategy
 
-    base_tier = TEXT_TIERS[tier_idx]
-    gated_tier = gate["default_tier"] if confidence < gate["confidence_threshold"] else base_tier
-    flags = compute_flags(message)
-    final_tier = apply_flag_upgrades(gated_tier, flags)
-    ranked_anchor_idx = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)
-    top_anchors = [
-        {"text": anchor_texts[i], "similarity": sims[i]}
-        for i in ranked_anchor_idx[:TOP_ANCHORS_REPORTED]
-    ]
-    return {
-        "band": "semantic",
-        "base_tier": base_tier,
-        "gated_tier": gated_tier,
-        "final_tier": final_tier,
-        "confidence": confidence,
-        "margin": margin,
-        "probabilities": dict(zip(TEXT_TIERS, probs)),
-        "flags": flags,
-        "flag_upgraded": final_tier != gated_tier,
-        "top_anchors": top_anchors,
-        "embedding": query_vector,
-    }
+        # require_router_runtime=True: raise on any load failure (missing deps,
+        # LFS pointers, bad bundle) so the caller's try/except degrades cleanly
+        # instead of silently serving the default tier every turn.
+        self._strategy = V4Phase3Strategy(
+            bundle_dir=bundle_dir,
+            confidence_threshold=confidence_threshold,
+            require_router_runtime=True,
+        )
 
-
-# ---------------------------------------------------------------------------
-# Embeddings client (OpenAI-compatible, urllib; no deps)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class EmbeddingsConfig:
-    url: str
-    model: str = "bge-small-zh-v1.5"
-    api_key: str | None = None
-    timeout_s: float = 2.0
-
-
-def embed_texts(config: EmbeddingsConfig, texts: list[str]) -> list[list[float]] | None:
-    """Return vectors in input order, or None on any failure (caller falls back)."""
-    payload = json.dumps({"model": config.model, "input": texts}).encode("utf-8")
-    request = urllib.request.Request(
-        config.url,
-        data=payload,
-        headers={
-            "content-type": "application/json",
-            **({"authorization": f"Bearer {config.api_key}"} if config.api_key else {}),
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=config.timeout_s) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        return None
-    data = body.get("data")
-    if not isinstance(data, list) or len(data) != len(texts):
-        return None
-    vectors: list[list[float] | None] = [None] * len(texts)
-    for position, item in enumerate(data):
-        if not isinstance(item, dict):
-            return None
-        embedding = item.get("embedding")
-        index = item.get("index", position)
-        if (
-            not isinstance(embedding, list)
-            or not embedding
-            or not isinstance(index, int)
-            or not 0 <= index < len(texts)
-            or vectors[index] is not None
-        ):
-            return None
-        vectors[index] = [float(v) for v in embedding]
-    dimension = len(vectors[0] or [])
-    if any(vector is None or len(vector) != dimension for vector in vectors):
-        return None
-    return vectors  # type: ignore[return-value]
+    def classify(self, message: str) -> dict[str, Any]:
+        # The strategy's classify() is async by interface but does no real IO;
+        # each request thread has no running loop, so asyncio.run is safe here.
+        tier, confidence, _source, extra = asyncio.run(
+            self._strategy.classify(message, list(TEXT_TIERS))
+        )
+        route_probs = extra.get("probabilities") or {}
+        probabilities = {
+            tier_name: float(route_probs.get(route_class, 0.0))
+            for route_class, tier_name in ROUTE_CLASS_TO_TIER.items()
+        }
+        # V4 does its own gating/postprocess internally, so base/gated/final all
+        # collapse to the returned tier; flag_upgraded/top_anchors don't apply.
+        return {
+            "band": "v4",
+            "base_tier": tier,
+            "gated_tier": tier,
+            "final_tier": tier,
+            "confidence": float(confidence),
+            "margin": float(extra.get("margin", 0.0)),
+            "probabilities": probabilities,
+            "flags": dict(extra.get("flags") or {}),
+            "flag_upgraded": False,
+            "top_anchors": [],
+            "embedding": None,
+            "route_class": str(extra.get("route_class") or ""),
+            "difficulty": float(extra.get("difficulty", 0.0)),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -602,34 +485,20 @@ class Central:
         self,
         *,
         store: Any,  # any object with the MySqlStore method surface (tests inject a fake)
-        embeddings: EmbeddingsConfig,
+        classifier: Any = None,  # V4Classifier (or a fake); None → heuristic fallback
         default_tier: str = "c1",
-        confidence_threshold: float = 0.5,
         policy_version: str = "central-py-v1",
         token: str | None = None,
-        embed_fn: Any = None,
         now_ms: Any = None,
     ) -> None:
         self.store = store
-        self.embeddings = embeddings
+        # None means the V4 model wasn't available at startup; every turn then
+        # routes through the dependency-free band heuristic.
+        self.classifier = classifier
         self.default_tier = default_tier
-        self.confidence_threshold = confidence_threshold
         self.policy_version = policy_version
         self.token = token
-        # Stored on the instance (not the class) so plain functions never turn
-        # into bound methods; both are injectable for tests.
-        self.embed_fn = embed_fn if embed_fn is not None else embed_texts
         self.now_ms = now_ms if now_ms is not None else (lambda: int(time.time() * 1000))
-        self._anchor_vectors: list[list[float]] | None = None
-        self._anchor_lock = threading.Lock()
-
-    # Anchors are constants; embed once per process. A failed load retries on
-    # the next request instead of poisoning the cache.
-    def _anchors(self) -> list[list[float]] | None:
-        with self._anchor_lock:
-            if self._anchor_vectors is None:
-                self._anchor_vectors = self.embed_fn(self.embeddings, flat_anchor_texts())
-            return self._anchor_vectors
 
     def handle(
         self, method: str, path: str, query: dict[str, list[str]], body: Any, auth: str | None
@@ -638,7 +507,7 @@ class Central:
             return 200, {
                 "status": "ok",
                 "policyVersion": self.policy_version,
-                "anchorsReady": self._anchor_vectors is not None,
+                "classifier": "v4" if self.classifier is not None else "heuristic",
             }
         if self.token is not None:
             provided = (auth or "").removeprefix("Bearer ").removeprefix("bearer ")
@@ -694,16 +563,10 @@ class Central:
         )
 
         started = self.now_ms()
-        # Semantic first; central-side heuristic when embeddings are down, so
-        # clients only use their local fallback when THIS service is down.
-        anchors = self._anchors()
-        query_vectors = self.embed_fn(self.embeddings, [message]) if anchors else None
-        if anchors and query_vectors:
-            gate = {
-                "default_tier": self.default_tier,
-                "confidence_threshold": self.confidence_threshold,
-            }
-            outcome = classify_semantic(message, query_vectors[0], anchors, gate)
+        # Real V4 model when available; central-side band heuristic otherwise, so
+        # clients only use their own local fallback when THIS service is down.
+        if self.classifier is not None:
+            outcome = self.classifier.classify(message)
         else:
             outcome = classify_heuristic(message, attachment_count)
 
@@ -740,11 +603,13 @@ class Central:
             "confidence": outcome["confidence"],
             "policyVersion": self.policy_version,
             "meta": {
-                "routeClass": ROUTE_CLASSES[TEXT_TIERS.index(final_tier)],
+                "routeClass": outcome.get("route_class")
+                or ROUTE_CLASSES[TEXT_TIERS.index(final_tier)],
                 "band": outcome["band"],
                 "flags": outcome["flags"],
                 "flagUpgraded": outcome["flag_upgraded"],
                 "margin": outcome["margin"],
+                "difficulty": outcome.get("difficulty", 0.0),
             },
         }
 
@@ -821,9 +686,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("SQUILLA_PORT", "8710")))
     args = parser.parse_args(argv)
 
-    embeddings_url = os.environ.get("SQUILLA_EMBEDDINGS_URL")
-    if not embeddings_url:
-        raise SystemExit("SQUILLA_EMBEDDINGS_URL is required")
+    default_tier = os.environ.get("SQUILLA_DEFAULT_TIER", "c1")
     central = Central(
         store=MySqlStore(
             MySqlConfig(
@@ -834,24 +697,34 @@ def main(argv: list[str] | None = None) -> None:
                 database=os.environ.get("SQUILLA_MYSQL_DATABASE", "squilla_central"),
             )
         ),
-        embeddings=EmbeddingsConfig(
-            url=embeddings_url,
-            model=os.environ.get("SQUILLA_EMBEDDINGS_MODEL", "bge-small-zh-v1.5"),
-            api_key=os.environ.get("SQUILLA_EMBEDDINGS_API_KEY"),
-            timeout_s=float(os.environ.get("SQUILLA_EMBEDDINGS_TIMEOUT_S", "2.0")),
-        ),
-        default_tier=(
-            os.environ.get("SQUILLA_DEFAULT_TIER", "c1")
-            if os.environ.get("SQUILLA_DEFAULT_TIER", "c1") in TEXT_TIERS
-            else "c1"
-        ),
-        confidence_threshold=float(os.environ.get("SQUILLA_CONFIDENCE_THRESHOLD", "0.5")),
+        classifier=_build_classifier(),
+        default_tier=default_tier if default_tier in TEXT_TIERS else "c1",
         policy_version=os.environ.get("SQUILLA_POLICY_VERSION", "central-py-v1"),
         token=os.environ.get("SQUILLA_CENTRAL_TOKEN") or None,
     )
     server = ThreadingHTTPServer((args.host, args.port), make_handler(central))
     print(f"squilla-central listening on http://{args.host}:{args.port}")
     server.serve_forever()
+
+
+def _build_classifier() -> V4Classifier | None:
+    """Build the real V4 classifier, or return None to run on the heuristic.
+
+    ``SQUILLA_V4=0`` forces the heuristic (no ML deps / bundle needed). Any load
+    failure (missing deps, unpulled LFS bundle, bad artifacts) is logged and
+    degrades to the heuristic rather than crashing the service.
+    """
+    if os.environ.get("SQUILLA_V4", "1").lower() not in ("1", "true", "yes"):
+        print("squilla-central: SQUILLA_V4 disabled; using heuristic classifier")
+        return None
+    try:
+        return V4Classifier(
+            bundle_dir=os.environ.get("SQUILLA_V4_BUNDLE_DIR") or None,
+            confidence_threshold=float(os.environ.get("SQUILLA_CONFIDENCE_THRESHOLD", "0.5")),
+        )
+    except Exception as exc:  # noqa: BLE001 - degrade on any load failure
+        print(f"squilla-central: V4 model unavailable ({exc}); using heuristic classifier")
+        return None
 
 
 if __name__ == "__main__":
