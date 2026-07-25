@@ -54,7 +54,22 @@ Wire contract (mirrored by the OpenClaw plugin's central-client.ts):
     POST /v1/feedback   {decisionId, rating: up|down|neutral}
     GET  /v1/decisions/{id} | /v1/decisions?tenantId&sessionKey&limit
     GET  /v1/stats?tenantId
+    GET  /v1/train/export?tenantId&sinceMs&limit
+                        -> {samples: [...RouterTrainSample...], count}
     GET  /healthz
+
+Self-learning capture: every classified turn stores the exact 390-dim feature
+vector the heads consumed plus its ``feature_schema_version``, the raw route
+class, a per-session ``turn_index``, and a ``complaint`` boolean derived from
+the message (never the message). Those are what turn a stream of decisions into
+a trainable corpus; ``/v1/train/export`` emits them in RouterTrainSample shape.
+
+Operator bias: ``SQUILLA_TIER_BIAS`` holds JSON rules that reweight the model's
+tier probabilities (e.g. "make c3 twice as likely 09:00-18:00"). A turn whose
+served tier an active rule actually moved is marked ``tainted`` and never
+leaves the export — a manual decision must not come back as a learned label.
+Taint propagates through sticky, so the turn after a biased one is excluded too
+when it was held on the biased tier.
 """
 
 from __future__ import annotations
@@ -69,6 +84,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -135,6 +151,51 @@ STICKY_DEFAULT_MAX_USER_LEN = 200
 RATINGS = {"up", "down", "neutral"}
 MAX_MESSAGE_CHARS = 64_000
 LIST_LIMIT_MAX = 100
+EXPORT_LIMIT_MAX = 5_000
+
+# OpenSquilla router_cfg.complaint_upgrade_max_chars default. A complaint is a
+# SHORT reaction ("不对", "答非所问"); the cap stops a long prompt that merely
+# quotes one of the terms from being read as dissatisfaction.
+COMPLAINT_MAX_CHARS = 160
+
+_complaint_terms_cache: tuple[str, ...] | None = None
+
+
+def complaint_terms() -> tuple[str, ...]:
+    """OpenSquilla's complaint term table, imported lazily.
+
+    ``policy_data`` is a pure-data module, but the import stays lazy so this
+    service remains importable (heuristic-only path, tests) on a host without
+    the opensquilla package. An empty table silently disables the single most
+    valuable training signal, so the failure is announced once.
+    """
+    global _complaint_terms_cache
+    if _complaint_terms_cache is None:
+        try:
+            from opensquilla.engine.routing.policy_data import COMPLAINT_TERMS
+
+            _complaint_terms_cache = tuple(COMPLAINT_TERMS)
+        except Exception as exc:  # noqa: BLE001 - degrade, but loudly
+            print(
+                f"squilla-central: complaint terms unavailable ({exc}); "
+                "captured turns will carry no correction signal"
+            )
+            _complaint_terms_cache = ()
+    return _complaint_terms_cache
+
+
+def detect_complaint(message: str) -> bool:
+    """Did this turn complain about the previous answer? (OpenSquilla parity.)
+
+    Recorded as a bare boolean: it is the label-alignment input that turns a
+    stream of confirmations into actual corrections, and it derives from text
+    the store never keeps.
+    """
+    text = message.strip()
+    if len(text) > COMPLAINT_MAX_CHARS:
+        return False
+    lowered = text.lower()
+    return any(term in lowered for term in complaint_terms())
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +272,123 @@ def snap_to_available(tier: str, available: list[str]) -> str:
     return available[0]
 
 
+@dataclass(frozen=True)
+class BiasRule:
+    """One operator override of the model's tier probabilities.
+
+    ``weights`` multiplies the per-tier probabilities before the tier is picked,
+    so an operator can say "make c3 twice as likely between 09:00 and 18:00".
+    Scope is an optional UTC hour window (wraps midnight) and an optional
+    profile set; an unscoped rule applies to every turn.
+    """
+
+    name: str
+    weights: dict[str, float]
+    hours: tuple[int, int] | None = None
+    profiles: frozenset[str] = frozenset()
+
+    def matches(self, profile: str, hour: int) -> bool:
+        if self.profiles and profile not in self.profiles:
+            return False
+        if self.hours is None:
+            return True
+        start, end = self.hours
+        # A window may wrap midnight (22->6), so the wrapped case is a union.
+        return start <= hour < end if start < end else (hour >= start or hour < end)
+
+
+def parse_bias_rules(raw: str | None) -> list[BiasRule]:
+    """Parse ``SQUILLA_TIER_BIAS`` (a JSON list) into rules; bad entries drop.
+
+    Shape: ``[{"name": "peak-c3", "weights": {"c3": 2.0}, "hours": [1, 10],
+    "profiles": ["squilla/auto"]}]``. Malformed entries are skipped with a
+    warning rather than failing startup — a broken bias rule must never take
+    routing down with it.
+    """
+    if not raw or not raw.strip():
+        return []
+    try:
+        entries = json.loads(raw)
+    except ValueError as exc:
+        print(f"squilla-central: SQUILLA_TIER_BIAS is not valid JSON ({exc}); ignoring")
+        return []
+    if not isinstance(entries, list):
+        print("squilla-central: SQUILLA_TIER_BIAS must be a JSON list; ignoring")
+        return []
+
+    rules: list[BiasRule] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        raw_weights = entry.get("weights")
+        if not isinstance(raw_weights, dict):
+            continue
+        weights = {
+            tier: float(value)
+            for tier, value in raw_weights.items()
+            if tier in TEXT_TIERS and isinstance(value, (int, float)) and float(value) > 0
+        }
+        if not weights:
+            print(f"squilla-central: bias rule #{index} has no usable weights; ignoring")
+            continue
+        raw_hours = entry.get("hours")
+        hours: tuple[int, int] | None = None
+        if isinstance(raw_hours, list) and len(raw_hours) == 2:
+            try:
+                start, end = int(raw_hours[0]) % 24, int(raw_hours[1]) % 24
+            except (TypeError, ValueError):
+                start = end = 0
+            if start != end:
+                hours = (start, end)
+        raw_profiles = entry.get("profiles")
+        profiles = (
+            frozenset(str(p) for p in raw_profiles)
+            if isinstance(raw_profiles, list)
+            else frozenset()
+        )
+        rules.append(
+            BiasRule(
+                name=str(entry.get("name") or f"rule-{index}"),
+                weights=weights,
+                hours=hours,
+                profiles=profiles,
+            )
+        )
+    return rules
+
+
+def match_bias_rule(rules: list[BiasRule], profile: str, hour: int) -> BiasRule | None:
+    """First matching rule wins, so order in config is the precedence order."""
+    for rule in rules:
+        if rule.matches(profile, hour):
+            return rule
+    return None
+
+
+def apply_tier_bias(
+    probabilities: dict[str, float], classifier_tier: str, rule: BiasRule
+) -> str:
+    """Shift the classifier's tier by the bias rule's effect on the argmax.
+
+    The bias is applied as a DELTA, not as an absolute re-selection: we compare
+    argmax(probabilities) against argmax(weighted probabilities) and move the
+    classifier's tier by that many steps. Re-running argmax outright would throw
+    away the model's postprocess (margin upgrade, under-routing safety net),
+    silently regressing turns the operator never meant to touch.
+    """
+    if classifier_tier not in TEXT_TIERS:
+        return classifier_tier
+    ranked = [float(probabilities.get(tier, 0.0)) for tier in TEXT_TIERS]
+    if not any(ranked):
+        return classifier_tier  # bypass turns carry no distribution to bias
+    weighted = [p * rule.weights.get(tier, 1.0) for p, tier in zip(ranked, TEXT_TIERS)]
+    shift = weighted.index(max(weighted)) - ranked.index(max(ranked))
+    if shift == 0:
+        return classifier_tier
+    moved = min(max(TEXT_TIERS.index(classifier_tier) + shift, 0), len(TEXT_TIERS) - 1)
+    return TEXT_TIERS[moved]
+
+
 def apply_sticky(
     desired: str, last_tier: str | None, prompt_len: int, sticky: dict[str, Any]
 ) -> tuple[str, bool]:
@@ -276,12 +454,27 @@ class V4Classifier:
 
     Only the current turn is fed: the store holds no plaintext history, so V4's
     history channels (prev user/assistant text, route history) stay empty —
-    first-turn feature quality. KV-cache stickiness is handled client-side.
+    first-turn feature quality. KV-cache stickiness is applied by the service.
+
+    ``capture_features`` turns on the self-learning capture hook: the strategy
+    then surfaces the exact 390-dim vector the heads consumed, which is the only
+    way a retrain can reproduce this decision. ``capture_raw_bge`` adds the
+    1536-dim raw embedding needed to retrain the MLP head (~4x the row size, so
+    it is opt-in on top).
     """
 
-    def __init__(self, bundle_dir: str | None = None, confidence_threshold: float = 0.5) -> None:
+    def __init__(
+        self,
+        bundle_dir: str | None = None,
+        confidence_threshold: float = 0.5,
+        *,
+        capture_features: bool = True,
+        capture_raw_bge: bool = False,
+    ) -> None:
+        from opensquilla.squilla_router.self_learning.schema import encode_features
         from opensquilla.squilla_router.v4_phase3 import V4Phase3Strategy
 
+        self._encode_features = encode_features
         # require_router_runtime=True: raise on any load failure (missing deps,
         # LFS pointers, bad bundle) so the caller's try/except degrades cleanly
         # instead of silently serving the default tier every turn.
@@ -289,7 +482,26 @@ class V4Classifier:
             bundle_dir=bundle_dir,
             confidence_threshold=confidence_threshold,
             require_router_runtime=True,
+            emit_train_features=capture_features,
+            emit_raw_bge=capture_raw_bge,
         )
+
+    def _training_capture(self, extra: dict[str, Any]) -> dict[str, Any]:
+        """Encode the captured feature vectors for storage (float16 base64).
+
+        ``feature_schema_version`` hashes the fitted projections, so a bundle
+        upgrade produces a new version and the offline builder refuses to mix
+        the two feature bases instead of training on a silently shifted space.
+        """
+        captured = extra.get("_train_features")
+        if not isinstance(captured, dict) or captured.get("features_390") is None:
+            return {}
+        raw_bge = captured.get("raw_bge_1536")
+        return {
+            "features_b64": self._encode_features(captured["features_390"]),
+            "raw_bge_b64": self._encode_features(raw_bge) if raw_bge is not None else None,
+            "feature_schema_version": str(captured.get("feature_schema_version") or "unknown"),
+        }
 
     def classify(self, message: str) -> dict[str, Any]:
         # The strategy's classify() is async by interface but does no real IO;
@@ -318,6 +530,7 @@ class V4Classifier:
             "embedding": None,
             "route_class": str(extra.get("route_class") or ""),
             "difficulty": float(extra.get("difficulty", 0.0)),
+            **self._training_capture(extra),
         }
 
 
@@ -351,9 +564,31 @@ CREATE TABLE IF NOT EXISTS decisions (
   policy_version VARCHAR(64) NOT NULL,
   latency_ms INT NOT NULL,
   embedding LONGTEXT NULL,
-  INDEX idx_decisions_session (tenant_id, session_key, ts_ms)
+  turn_index INT NOT NULL DEFAULT 0,
+  route_class VARCHAR(8) NOT NULL DEFAULT '',
+  complaint TINYINT(1) NOT NULL DEFAULT 0,
+  feature_schema_version VARCHAR(64) NOT NULL DEFAULT '',
+  features_b64 LONGTEXT NULL,
+  raw_bge_b64 LONGTEXT NULL,
+  bias_rule VARCHAR(64) NOT NULL DEFAULT '',
+  tainted TINYINT(1) NOT NULL DEFAULT 0,
+  INDEX idx_decisions_session (tenant_id, session_key, ts_ms),
+  INDEX idx_decisions_export (tenant_id, tainted, ts_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
+# Columns added after the table first shipped. CREATE TABLE IF NOT EXISTS is a
+# no-op on an existing table, so an upgraded deployment needs them added
+# explicitly; every one carries a DEFAULT so old rows stay readable.
+_DECISION_COLUMN_ADDITIONS = (
+    ("turn_index", "INT NOT NULL DEFAULT 0"),
+    ("route_class", "VARCHAR(8) NOT NULL DEFAULT ''"),
+    ("complaint", "TINYINT(1) NOT NULL DEFAULT 0"),
+    ("feature_schema_version", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("features_b64", "LONGTEXT NULL"),
+    ("raw_bge_b64", "LONGTEXT NULL"),
+    ("bias_rule", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("tainted", "TINYINT(1) NOT NULL DEFAULT 0"),
+)
 _DDL_FEEDBACK = """
 CREATE TABLE IF NOT EXISTS feedback (
   decision_id VARCHAR(64) NOT NULL PRIMARY KEY,
@@ -365,8 +600,64 @@ CREATE TABLE IF NOT EXISTS feedback (
 _SUMMARY_COLUMNS = (
     "decision_id, tenant_id, session_key, profile, ts_ms, band, base_tier, gated_tier, "
     "final_tier, classifier_tier, stuck, confidence, margin, probabilities, flags, char_len, "
-    "attachment_count, top_anchors, policy_version, latency_ms"
+    "attachment_count, top_anchors, policy_version, latency_ms, turn_index, route_class, "
+    "complaint, bias_rule, tainted"
 )
+# Ordered to match RouterTrainSample's field names so an exported row feeds
+# opensquilla's offline builder without a translation layer.
+_EXPORT_COLUMNS = (
+    "session_key, turn_index, ts_ms, feature_schema_version, features_b64, raw_bge_b64, "
+    "route_class, final_tier, probabilities, margin, confidence, complaint, band, decision_id"
+)
+# Column list for insert_decision; keeping it explicit (rather than relying on
+# table order) means an ALTER on an upgraded deployment cannot silently shift
+# values into the wrong columns.
+_INSERT_COLUMNS = (
+    "decision_id, tenant_id, session_key, profile, ts_ms, band, base_tier, gated_tier, "
+    "final_tier, classifier_tier, stuck, confidence, margin, probabilities, flags, char_len, "
+    "attachment_count, top_anchors, policy_version, latency_ms, embedding, turn_index, "
+    "route_class, complaint, feature_schema_version, features_b64, raw_bge_b64, bias_rule, "
+    "tainted"
+)
+
+
+_TIER_TO_ROUTE_CLASS = {tier: route for route, tier in ROUTE_CLASS_TO_TIER.items()}
+
+
+def _train_sample(row: tuple) -> dict[str, Any]:
+    """Map an ``_EXPORT_COLUMNS`` row onto RouterTrainSample's field names.
+
+    Field-for-field so ``RouterTrainSample.from_json_dict`` consumes the output
+    directly. Three fields are pinned rather than stored: this service applies
+    no confidence gate or large-context floor (V4 does its own postprocess and
+    surfaces no flag for either), and it never serves counterfactual tiers —
+    deliberate bias is recorded as ``tainted`` and excluded above, which is the
+    opposite of an exploration sample the aligner would keep.
+    """
+    probabilities = json.loads(row[8]) if row[8] else {}
+    final_tier = str(row[7])
+    return {
+        "session_key": row[0],
+        "turn_index": int(row[1]),
+        "ts": datetime.fromtimestamp(int(row[2]) / 1000, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "feature_schema_version": row[3] or "unknown",
+        "features_390_b64": row[4],
+        "raw_bge_1536_b64": row[5],
+        "route_class": row[6] or _TIER_TO_ROUTE_CLASS.get(final_tier, "R1"),
+        # The served tier IS the label: the client applies it verbatim.
+        "final_route_class": _TIER_TO_ROUTE_CLASS.get(final_tier, "R1"),
+        "routed_tier": final_tier,
+        "probabilities": [float(probabilities.get(tier, 0.0)) for tier in TEXT_TIERS],
+        "margin": float(row[9]),
+        "confidence": float(row[10]),
+        "complaint_detected": bool(row[11]),
+        "anti_downgrade_applied": False,
+        "confidence_gate_applied": False,
+        "large_context_floor_applied": False,
+        "image_route": row[12] == "image",
+        "exploration": False,
+        "decision_id": row[13],
+    }
 
 
 @dataclass
@@ -398,7 +689,16 @@ class MySqlStore:
             with self._conn.cursor() as cursor:
                 cursor.execute(_DDL_DECISIONS)
                 cursor.execute(_DDL_FEEDBACK)
+                self._add_missing_columns(cursor)
             self._conn.commit()
+
+    def _add_missing_columns(self, cursor) -> None:
+        """Bring an already-created ``decisions`` table up to the current shape."""
+        cursor.execute("SHOW COLUMNS FROM decisions")
+        existing = {str(row[0]) for row in cursor.fetchall()}
+        for column, definition in _DECISION_COLUMN_ADDITIONS:
+            if column not in existing:
+                cursor.execute(f"ALTER TABLE decisions ADD COLUMN {column} {definition}")
 
     def _connect(self):
         return self._pymysql.connect(
@@ -416,34 +716,43 @@ class MySqlStore:
         return self._conn.cursor()
 
     def insert_decision(self, record: dict[str, Any]) -> None:
+        values = (
+            record["decisionId"],
+            record["tenantId"],
+            record["sessionKey"],
+            record["profile"],
+            record["tsMs"],
+            record["band"],
+            record["baseTier"],
+            record["gatedTier"],
+            record["finalTier"],
+            record["classifierTier"],
+            int(bool(record["stuck"])),
+            record["confidence"],
+            record["margin"],
+            json.dumps(record["probabilities"]),
+            json.dumps(record["flags"]),
+            record["charLen"],
+            record["attachmentCount"],
+            json.dumps(record["topAnchors"], ensure_ascii=False),
+            record["policyVersion"],
+            record["latencyMs"],
+            json.dumps(record["embedding"]) if record["embedding"] is not None else None,
+            record["turnIndex"],
+            record["routeClass"],
+            int(bool(record["complaint"])),
+            record["featureSchemaVersion"],
+            record["featuresB64"],
+            record["rawBgeB64"],
+            record["biasRule"],
+            int(bool(record["tainted"])),
+        )
         with self._lock, self._cursor() as cursor:
             cursor.execute(
-                "INSERT INTO decisions VALUES ("
-                + ", ".join(["%s"] * 21)
+                f"INSERT INTO decisions ({_INSERT_COLUMNS}) VALUES ("
+                + ", ".join(["%s"] * len(values))
                 + ")",
-                (
-                    record["decisionId"],
-                    record["tenantId"],
-                    record["sessionKey"],
-                    record["profile"],
-                    record["tsMs"],
-                    record["band"],
-                    record["baseTier"],
-                    record["gatedTier"],
-                    record["finalTier"],
-                    record["classifierTier"],
-                    int(bool(record["stuck"])),
-                    record["confidence"],
-                    record["margin"],
-                    json.dumps(record["probabilities"]),
-                    json.dumps(record["flags"]),
-                    record["charLen"],
-                    record["attachmentCount"],
-                    json.dumps(record["topAnchors"], ensure_ascii=False),
-                    record["policyVersion"],
-                    record["latencyMs"],
-                    json.dumps(record["embedding"]) if record["embedding"] is not None else None,
-                ),
+                values,
             )
             self._conn.commit()
 
@@ -469,6 +778,11 @@ class MySqlStore:
             "topAnchors": json.loads(row[17]),
             "policyVersion": row[18],
             "latencyMs": row[19],
+            "turnIndex": row[20],
+            "routeClass": row[21],
+            "complaint": bool(row[22]),
+            "biasRule": row[23],
+            "tainted": bool(row[24]),
             "rating": rating,
         }
 
@@ -507,23 +821,46 @@ class MySqlStore:
             rows = cursor.fetchall()
             return [self._summary(row, self._rating(cursor, row[0])) for row in rows]
 
-    def last_tier(self, tenant_id: str, session_key: str) -> str | None:
-        """Previously served tier for a session — the sticky comparison basis.
+    def last_decision(self, tenant_id: str, session_key: str) -> dict[str, Any] | None:
+        """The session's previous turn: sticky basis, taint chain, turn counter.
 
         Reads the decision trail rather than process memory so sticky stays
         correct across central instances and restarts (idx_decisions_session
-        covers this exact lookup).
+        covers this exact lookup). One query serves all three needs, so the hot
+        path keeps a single round trip.
         """
         if not session_key:
             return None
         with self._lock, self._cursor() as cursor:
             cursor.execute(
-                "SELECT final_tier FROM decisions WHERE tenant_id = %s AND session_key = %s "
-                "ORDER BY ts_ms DESC LIMIT 1",
+                "SELECT final_tier, tainted, turn_index FROM decisions "
+                "WHERE tenant_id = %s AND session_key = %s ORDER BY ts_ms DESC LIMIT 1",
                 (tenant_id, session_key),
             )
             row = cursor.fetchone()
-            return row[0] if row else None
+            if row is None:
+                return None
+            return {"tier": row[0], "tainted": bool(row[1]), "turnIndex": int(row[2])}
+
+    def export_training_rows(
+        self, tenant_id: str, since_ms: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """Training rows for one tenant, in RouterTrainSample shape.
+
+        ``tainted = 0`` is the hard discard: any turn whose served tier was
+        moved by an operator bias rule — or held onto a biased tier by sticky —
+        never leaves this query, so a manual override can never become a
+        training label. ``features_b64 IS NOT NULL`` drops turns captured before
+        the feature hook was on and turns that bypassed the classifier.
+        """
+        with self._lock, self._cursor() as cursor:
+            cursor.execute(
+                f"SELECT {_EXPORT_COLUMNS} FROM decisions "
+                "WHERE tenant_id = %s AND tainted = 0 AND features_b64 IS NOT NULL "
+                "AND ts_ms >= %s ORDER BY ts_ms ASC LIMIT %s",
+                (tenant_id, since_ms, limit),
+            )
+            return [_train_sample(row) for row in cursor.fetchall()]
 
     def record_feedback(self, decision_id: str, rating: str, ts_ms: int) -> bool:
         with self._lock, self._cursor() as cursor:
@@ -563,11 +900,28 @@ class MySqlStore:
                 (tenant_id,),
             )
             ratings = cursor.fetchall()
+            # Corpus health: a dataset of pure confirmations trains nothing, so
+            # `complaints` + rated rows are the numbers that say whether a
+            # retrain is worth running at all.
+            cursor.execute(
+                "SELECT COUNT(*), SUM(features_b64 IS NOT NULL), SUM(tainted), SUM(complaint), "
+                "SUM(features_b64 IS NOT NULL AND tainted = 0) "
+                "FROM decisions WHERE tenant_id = %s",
+                (tenant_id,),
+            )
+            total, captured, tainted, complaints, trainable = cursor.fetchone() or (0, 0, 0, 0, 0)
         return {
             "tiers": {row[0]: row[1] for row in tiers},
             "bands": {row[0]: row[1] for row in bands},
             "profiles": {row[0]: row[1] for row in profiles},
             "ratings": {row[0]: row[1] for row in ratings},
+            "training": {
+                "decisions": int(total or 0),
+                "withFeatures": int(captured or 0),
+                "tainted": int(tainted or 0),
+                "complaints": int(complaints or 0),
+                "trainable": int(trainable or 0),
+            },
         }
 
     def close(self) -> None:
@@ -587,6 +941,7 @@ class Central:
         classifier: Any = None,  # V4Classifier (or a fake); None → heuristic fallback
         default_tier: str = "c1",
         sticky: dict[str, Any] | None = None,
+        bias_rules: list[BiasRule] | None = None,
         policy_version: str = "central-py-v1",
         token: str | None = None,
         now_ms: Any = None,
@@ -598,6 +953,10 @@ class Central:
         # KV-cache sticky policy (moved here from the plugin, which is now
         # pass-through). tokenhub can version this alongside the other policy.
         self.sticky = sticky if sticky is not None else {"enabled": True}
+        # Operator tier-probability overrides. Any turn one of these actually
+        # moves is marked tainted and excluded from training export — a manual
+        # decision must never come back as a learned label.
+        self.bias_rules = bias_rules or []
         self.default_tier = default_tier
         self.policy_version = policy_version
         self.token = token
@@ -640,7 +999,32 @@ class Central:
             if not tenant_id:
                 return 400, {"error": "tenantId is required"}
             return 200, self.store.stats(tenant_id)
+        if path == "/v1/train/export" and method == "GET":
+            return self._export(query)
         return 404, {"error": "not found"}
+
+    def _export(self, query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+        """Training corpus for one tenant, already stripped of biased turns.
+
+        Rows come out in RouterTrainSample field shape, so the offline builder
+        consumes them directly. The taint filter lives in the store query rather
+        than here: exclusion is a property of the data, not of this endpoint,
+        and any future reader gets it for free.
+        """
+        tenant_id = (query.get("tenantId") or [None])[0]
+        if not tenant_id:
+            return 400, {"error": "tenantId is required"}
+        try:
+            since_ms = int((query.get("sinceMs") or ["0"])[0])
+        except ValueError:
+            since_ms = 0
+        try:
+            limit = int((query.get("limit") or ["1000"])[0])
+        except ValueError:
+            limit = 1000
+        limit = max(1, min(limit, EXPORT_LIMIT_MAX))
+        samples = self.store.export_training_rows(tenant_id, max(since_ms, 0), limit)
+        return 200, {"samples": samples, "count": len(samples)}
 
     def _route(self, body: Any) -> tuple[int, dict[str, Any]]:
         if not isinstance(body, dict):
@@ -688,11 +1072,36 @@ class Central:
             outcome = classify_heuristic(message, attachment_count)
 
         # Client is pass-through, so every remaining judgment happens here:
-        # snap onto a servable tier, then KV-cache sticky against the tier this
-        # session was actually served last turn.
-        desired = snap_to_available(outcome["final_tier"], available)
-        last_tier = self.store.last_tier(tenant_id, session_key)
+        # operator bias -> snap onto a servable tier -> KV-cache sticky against
+        # the tier this session was actually served last turn.
+        classifier_tier = outcome["final_tier"]
+        rule = (
+            None
+            if has_image
+            else match_bias_rule(
+                self.bias_rules,
+                profile,
+                datetime.fromtimestamp(started / 1000, tz=UTC).hour,
+            )
+        )
+        biased_tier = (
+            apply_tier_bias(outcome["probabilities"], classifier_tier, rule)
+            if rule is not None
+            else classifier_tier
+        )
+        desired = snap_to_available(biased_tier, available)
+        previous = self.store.last_decision(tenant_id, session_key)
+        last_tier = previous["tier"] if previous else None
         served, stuck = apply_sticky(desired, last_tier, len(message), self.sticky)
+
+        # Taint marks a turn whose served tier reflects an operator decision
+        # rather than the model's. It propagates through sticky: a turn held on
+        # a biased tier was also not chosen by the model, and training on it
+        # would launder the override back in as a label one turn later.
+        tainted = biased_tier != classifier_tier or bool(
+            stuck and previous is not None and previous["tainted"]
+        )
+        capture = outcome.get("features_b64")
 
         record = {
             "decisionId": str(uuid.uuid4()),
@@ -707,7 +1116,7 @@ class Central:
             # client applies it verbatim, so this column is a truthful training
             # label; classifierTier keeps the model's own pick for diagnostics.
             "finalTier": served,
-            "classifierTier": outcome["final_tier"],
+            "classifierTier": classifier_tier,
             "stuck": stuck,
             "confidence": outcome["confidence"],
             "margin": outcome["margin"],
@@ -719,6 +1128,17 @@ class Central:
             "policyVersion": self.policy_version,
             "latencyMs": self.now_ms() - started,
             "embedding": outcome["embedding"],
+            # Self-learning capture. turnIndex + complaint are the label
+            # alignment inputs; features/schema version are what a retrain
+            # actually consumes; biasRule + tainted are the discard controls.
+            "turnIndex": (previous["turnIndex"] + 1) if previous else 0,
+            "routeClass": outcome.get("route_class") or "",
+            "complaint": detect_complaint(message),
+            "featureSchemaVersion": outcome.get("feature_schema_version") or "",
+            "featuresB64": capture,
+            "rawBgeB64": outcome.get("raw_bge_b64"),
+            "biasRule": rule.name if rule is not None else "",
+            "tainted": tainted,
         }
         self.store.insert_decision(record)
         # Generic wire response: `tier` (the abstract c0-c3 capability tier the
@@ -741,8 +1161,12 @@ class Central:
                 "difficulty": outcome.get("difficulty", 0.0),
                 # What the classifier picked before snap/sticky, so a surprising
                 # served tier is explainable straight from the response.
-                "classifierTier": outcome["final_tier"],
+                "classifierTier": classifier_tier,
                 "stuck": stuck,
+                # Named so an operator can see WHICH rule moved a turn without
+                # opening the store; empty when the model's pick stood.
+                "biasRule": rule.name if rule is not None else "",
+                "tainted": tainted,
             },
         }
 
@@ -813,6 +1237,11 @@ def make_handler(central: Central) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    return default if raw is None else raw.strip().lower() in ("1", "true", "yes")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="SquillaRouter central routing service")
     parser.add_argument("--host", default=os.environ.get("SQUILLA_HOST", "127.0.0.1"))
@@ -833,11 +1262,12 @@ def main(argv: list[str] | None = None) -> None:
         classifier=_build_classifier(),
         default_tier=default_tier if default_tier in TEXT_TIERS else "c1",
         sticky={
-            "enabled": os.environ.get("SQUILLA_STICKY", "1").lower() in ("1", "true", "yes"),
+            "enabled": _env_flag("SQUILLA_STICKY", True),
             "maxUserLen": int(
                 os.environ.get("SQUILLA_STICKY_MAX_USER_LEN", STICKY_DEFAULT_MAX_USER_LEN)
             ),
         },
+        bias_rules=parse_bias_rules(os.environ.get("SQUILLA_TIER_BIAS")),
         policy_version=os.environ.get("SQUILLA_POLICY_VERSION", "central-py-v1"),
         token=os.environ.get("SQUILLA_CENTRAL_TOKEN") or None,
     )
@@ -860,6 +1290,9 @@ def _build_classifier() -> V4Classifier | None:
         return V4Classifier(
             bundle_dir=os.environ.get("SQUILLA_V4_BUNDLE_DIR") or None,
             confidence_threshold=float(os.environ.get("SQUILLA_CONFIDENCE_THRESHOLD", "0.5")),
+            capture_features=_env_flag("SQUILLA_CAPTURE_FEATURES", True),
+            # ~4x the row size; only needed to retrain the MLP head.
+            capture_raw_bge=_env_flag("SQUILLA_CAPTURE_RAW_BGE", False),
         )
     except Exception as exc:  # noqa: BLE001 - degrade on any load failure
         print(f"squilla-central: V4 model unavailable ({exc}); using heuristic classifier")
