@@ -1,12 +1,18 @@
 """Central SquillaRouter service: ALL routing intelligence lives here.
 
-The OpenClaw ``squilla-router`` plugin is a thin client — it POSTs the message
-text and gets an abstract tier back. This service runs OpenSquilla's real V4
+The OpenClaw ``squilla-router`` plugin is a PURE PASS-THROUGH client — it POSTs
+the turn and applies the tier it gets back, making no routing judgment of its
+own (no classification, no KV-cache sticky, no image handling, no tier
+snapping). All of that lives here. This service runs OpenSquilla's real V4
 Phase 3 model (the trained BGE-ONNX + LightGBM + MLP ensemble, via
 ``V4Phase3Strategy``), records a plaintext-free decision trail keyed by
 decisionId in MySQL, and accepts feedback for later self-learning. If the V4
 model bundle or its ML deps are unavailable it degrades to the dependency-free
 band heuristic (``classify_heuristic``) so routing still answers.
+
+Because the client applies the returned tier verbatim, ``decisions.final_tier``
+is exactly the tier that was served — a truthful self-learning label.
+``classifier_tier`` keeps the model's own pick for diagnostics.
 
 Deps: PyMySQL always; the V4 path additionally needs ``opensquilla[recommended]``
 (numpy / lightgbm / onnxruntime / scikit-learn / joblib) plus the Git-LFS model
@@ -39,9 +45,12 @@ Run:
     # SQUILLA_V4=0 forces the heuristic fallback (no ML deps / bundle needed).
 
 Wire contract (mirrored by the OpenClaw plugin's central-client.ts):
-    POST /v1/route      {tenantId, sessionKey, profile?, message, attachmentCount}
+    POST /v1/route      {tenantId, sessionKey, profile?, message, attachmentCount,
+                         hasImage?, availableTiers?}
                         -> {decisionId, tier, confidence, policyVersion,
                             meta: {...algorithm-specific, opaque to client}}
+                        `tier` is the SERVED tier: the client is pure
+                        pass-through and applies it verbatim.
     POST /v1/feedback   {decisionId, rating: up|down|neutral}
     GET  /v1/decisions/{id} | /v1/decisions?tenantId&sessionKey&limit
     GET  /v1/stats?tenantId
@@ -117,6 +126,12 @@ LOG_BLOCK_RE = re.compile(
 )
 FILE_PATH_RE = re.compile(r"(?:^|[\s\"'`(])([a-zA-Z_][\w.-]*/[\w./-]+\.\w+)", re.MULTILINE)
 
+# Sticky defaults (OpenSquilla sticky_tier.max_user_len). Enabled by default:
+# the client is pass-through, so the tier recorded here is exactly the tier
+# served, and the prev-route accuracy concern that gated it off upstream does
+# not apply.
+STICKY_DEFAULT_MAX_USER_LEN = 200
+
 RATINGS = {"up", "down", "neutral"}
 MAX_MESSAGE_CHARS = 64_000
 LIST_LIMIT_MAX = 100
@@ -158,6 +173,65 @@ def apply_flag_upgrades(tier: str, flags: dict[str, bool]) -> str:
     if flags["repoArch"]:
         idx = max(idx, 1)
     return TEXT_TIERS[idx]
+
+
+def bypass_outcome(tier: str, band: str) -> dict[str, Any]:
+    """Outcome shape for turns that skip the text classifier (e.g. image turns)."""
+    return {
+        "band": band,
+        "base_tier": tier,
+        "gated_tier": tier,
+        "final_tier": tier,
+        "confidence": 1.0,
+        "margin": 0.0,
+        "probabilities": {t: 0.0 for t in TEXT_TIERS},
+        "flags": {},
+        "flag_upgraded": False,
+        "top_anchors": [],
+        "embedding": None,
+    }
+
+
+def snap_to_available(tier: str, available: list[str]) -> str:
+    """Snap a tier onto one the client can actually serve.
+
+    Prefer the same tier, then walk UP so an unconfigured tier never silently
+    downgrades a turn, then walk down. Client-side profiles may configure only a
+    subset of c0-c3, so this runs centrally and the client does a pure lookup.
+    """
+    if not available:
+        return tier
+    start = TEXT_TIERS.index(tier) if tier in TEXT_TIERS else 1
+    for candidate in TEXT_TIERS[start:]:
+        if candidate in available:
+            return candidate
+    for candidate in reversed(TEXT_TIERS[:start]):
+        if candidate in available:
+            return candidate
+    return available[0]
+
+
+def apply_sticky(
+    desired: str, last_tier: str | None, prompt_len: int, sticky: dict[str, Any]
+) -> tuple[str, bool]:
+    """KV-cache-aware sticky routing (OpenSquilla predictor.py _apply_sticky_tier).
+
+    Switching models mid-session throws away the provider-side prompt cache, so a
+    "cheaper" tier can cost MORE (re-paying the whole context uncached). On a
+    short continuation turn, never route below the previous turn's tier. Only
+    downgrades are blocked — an upgrade busts the cache too, but a genuinely
+    harder turn is worth it.
+
+    Runs centrally: the client is pass-through, so the tier returned here IS the
+    served tier, which keeps the decision trail an accurate training label.
+    """
+    if not sticky.get("enabled", True) or not last_tier or last_tier not in TEXT_TIERS:
+        return desired, False
+    if prompt_len > int(sticky.get("maxUserLen", STICKY_DEFAULT_MAX_USER_LEN)):
+        return desired, False
+    if TEXT_TIERS.index(last_tier) <= TEXT_TIERS.index(desired):
+        return desired, False
+    return last_tier, True
 
 
 def classify_heuristic(message: str, attachment_count: int) -> dict[str, Any]:
@@ -265,6 +339,8 @@ CREATE TABLE IF NOT EXISTS decisions (
   base_tier VARCHAR(8) NOT NULL,
   gated_tier VARCHAR(8) NOT NULL,
   final_tier VARCHAR(8) NOT NULL,
+  classifier_tier VARCHAR(8) NOT NULL DEFAULT '',
+  stuck TINYINT(1) NOT NULL DEFAULT 0,
   confidence DOUBLE NOT NULL,
   margin DOUBLE NOT NULL,
   probabilities LONGTEXT NOT NULL,
@@ -288,7 +364,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 _SUMMARY_COLUMNS = (
     "decision_id, tenant_id, session_key, profile, ts_ms, band, base_tier, gated_tier, "
-    "final_tier, confidence, margin, probabilities, flags, char_len, "
+    "final_tier, classifier_tier, stuck, confidence, margin, probabilities, flags, char_len, "
     "attachment_count, top_anchors, policy_version, latency_ms"
 )
 
@@ -342,8 +418,9 @@ class MySqlStore:
     def insert_decision(self, record: dict[str, Any]) -> None:
         with self._lock, self._cursor() as cursor:
             cursor.execute(
-                "INSERT INTO decisions VALUES "
-                "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "INSERT INTO decisions VALUES ("
+                + ", ".join(["%s"] * 21)
+                + ")",
                 (
                     record["decisionId"],
                     record["tenantId"],
@@ -354,6 +431,8 @@ class MySqlStore:
                     record["baseTier"],
                     record["gatedTier"],
                     record["finalTier"],
+                    record["classifierTier"],
+                    int(bool(record["stuck"])),
                     record["confidence"],
                     record["margin"],
                     json.dumps(record["probabilities"]),
@@ -379,15 +458,17 @@ class MySqlStore:
             "baseTier": row[6],
             "gatedTier": row[7],
             "finalTier": row[8],
-            "confidence": row[9],
-            "margin": row[10],
-            "probabilities": json.loads(row[11]),
-            "flags": json.loads(row[12]),
-            "charLen": row[13],
-            "attachmentCount": row[14],
-            "topAnchors": json.loads(row[15]),
-            "policyVersion": row[16],
-            "latencyMs": row[17],
+            "classifierTier": row[9],
+            "stuck": bool(row[10]),
+            "confidence": row[11],
+            "margin": row[12],
+            "probabilities": json.loads(row[13]),
+            "flags": json.loads(row[14]),
+            "charLen": row[15],
+            "attachmentCount": row[16],
+            "topAnchors": json.loads(row[17]),
+            "policyVersion": row[18],
+            "latencyMs": row[19],
             "rating": rating,
         }
 
@@ -425,6 +506,24 @@ class MySqlStore:
                 )
             rows = cursor.fetchall()
             return [self._summary(row, self._rating(cursor, row[0])) for row in rows]
+
+    def last_tier(self, tenant_id: str, session_key: str) -> str | None:
+        """Previously served tier for a session — the sticky comparison basis.
+
+        Reads the decision trail rather than process memory so sticky stays
+        correct across central instances and restarts (idx_decisions_session
+        covers this exact lookup).
+        """
+        if not session_key:
+            return None
+        with self._lock, self._cursor() as cursor:
+            cursor.execute(
+                "SELECT final_tier FROM decisions WHERE tenant_id = %s AND session_key = %s "
+                "ORDER BY ts_ms DESC LIMIT 1",
+                (tenant_id, session_key),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
 
     def record_feedback(self, decision_id: str, rating: str, ts_ms: int) -> bool:
         with self._lock, self._cursor() as cursor:
@@ -487,6 +586,7 @@ class Central:
         store: Any,  # any object with the MySqlStore method surface (tests inject a fake)
         classifier: Any = None,  # V4Classifier (or a fake); None → heuristic fallback
         default_tier: str = "c1",
+        sticky: dict[str, Any] | None = None,
         policy_version: str = "central-py-v1",
         token: str | None = None,
         now_ms: Any = None,
@@ -495,6 +595,9 @@ class Central:
         # None means the V4 model wasn't available at startup; every turn then
         # routes through the dependency-free band heuristic.
         self.classifier = classifier
+        # KV-cache sticky policy (moved here from the plugin, which is now
+        # pass-through). tokenhub can version this alongside the other policy.
+        self.sticky = sticky if sticky is not None else {"enabled": True}
         self.default_tier = default_tier
         self.policy_version = policy_version
         self.token = token
@@ -561,14 +664,35 @@ class Central:
             if isinstance(raw_attachments, (int, float)) and raw_attachments > 0
             else 0
         )
+        has_image = body.get("hasImage") is True
+        # Tiers the calling profile can actually serve. Absent -> assume all, so
+        # a client that omits it still gets a valid tier.
+        raw_available = body.get("availableTiers")
+        available = (
+            [t for t in raw_available if t in TEXT_TIERS]
+            if isinstance(raw_available, list)
+            else list(TEXT_TIERS)
+        ) or list(TEXT_TIERS)
 
         started = self.now_ms()
-        # Real V4 model when available; central-side band heuristic otherwise, so
-        # clients only use their own local fallback when THIS service is down.
-        if self.classifier is not None:
+        # Image turns bypass the text classifier: text complexity says nothing
+        # about vision needs, so serve the strongest available tier (most likely
+        # to be vision-capable).
+        if has_image:
+            outcome = bypass_outcome(available[-1], "image")
+        elif self.classifier is not None:
             outcome = self.classifier.classify(message)
         else:
+            # Central-side band heuristic, so clients only serve their own
+            # defaultTier when THIS service is unreachable.
             outcome = classify_heuristic(message, attachment_count)
+
+        # Client is pass-through, so every remaining judgment happens here:
+        # snap onto a servable tier, then KV-cache sticky against the tier this
+        # session was actually served last turn.
+        desired = snap_to_available(outcome["final_tier"], available)
+        last_tier = self.store.last_tier(tenant_id, session_key)
+        served, stuck = apply_sticky(desired, last_tier, len(message), self.sticky)
 
         record = {
             "decisionId": str(uuid.uuid4()),
@@ -579,7 +703,12 @@ class Central:
             "band": outcome["band"],
             "baseTier": outcome["base_tier"],
             "gatedTier": outcome["gated_tier"],
-            "finalTier": outcome["final_tier"],
+            # finalTier is the tier actually SERVED (after snap + sticky). The
+            # client applies it verbatim, so this column is a truthful training
+            # label; classifierTier keeps the model's own pick for diagnostics.
+            "finalTier": served,
+            "classifierTier": outcome["final_tier"],
+            "stuck": stuck,
             "confidence": outcome["confidence"],
             "margin": outcome["margin"],
             "probabilities": outcome["probabilities"],
@@ -592,24 +721,28 @@ class Central:
             "embedding": outcome["embedding"],
         }
         self.store.insert_decision(record)
-        final_tier = outcome["final_tier"]
         # Generic wire response: `tier` (the abstract c0-c3 capability tier the
         # client maps to a model) + confidence are the only contract; everything
         # algorithm-specific goes under opaque `meta`, which the client logs but
         # never branches on. Swapping the classifier keeps this shape unchanged.
+        # `tier` is the SERVED tier — the client applies it verbatim.
         return 200, {
             "decisionId": record["decisionId"],
-            "tier": final_tier,
+            "tier": served,
             "confidence": outcome["confidence"],
             "policyVersion": self.policy_version,
             "meta": {
                 "routeClass": outcome.get("route_class")
-                or ROUTE_CLASSES[TEXT_TIERS.index(final_tier)],
+                or ROUTE_CLASSES[TEXT_TIERS.index(served)],
                 "band": outcome["band"],
                 "flags": outcome["flags"],
                 "flagUpgraded": outcome["flag_upgraded"],
                 "margin": outcome["margin"],
                 "difficulty": outcome.get("difficulty", 0.0),
+                # What the classifier picked before snap/sticky, so a surprising
+                # served tier is explainable straight from the response.
+                "classifierTier": outcome["final_tier"],
+                "stuck": stuck,
             },
         }
 
@@ -699,6 +832,12 @@ def main(argv: list[str] | None = None) -> None:
         ),
         classifier=_build_classifier(),
         default_tier=default_tier if default_tier in TEXT_TIERS else "c1",
+        sticky={
+            "enabled": os.environ.get("SQUILLA_STICKY", "1").lower() in ("1", "true", "yes"),
+            "maxUserLen": int(
+                os.environ.get("SQUILLA_STICKY_MAX_USER_LEN", STICKY_DEFAULT_MAX_USER_LEN)
+            ),
+        },
         policy_version=os.environ.get("SQUILLA_POLICY_VERSION", "central-py-v1"),
         token=os.environ.get("SQUILLA_CENTRAL_TOKEN") or None,
     )

@@ -10,6 +10,8 @@ from services.squilla_central.server import (
     Central,
     MySqlConfig,
     MySqlStore,
+    apply_sticky,
+    snap_to_available,
 )
 
 
@@ -42,6 +44,15 @@ class FakeStore:
         ]
         rows.sort(key=lambda r: r["tsMs"], reverse=True)
         return [self._summary(r) for r in rows[:limit]]
+
+    def last_tier(self, tenant_id, session_key):
+        rows = [
+            r
+            for r in self.decisions.values()
+            if r["tenantId"] == tenant_id and r["sessionKey"] == session_key
+        ]
+        rows.sort(key=lambda r: r["tsMs"], reverse=True)
+        return rows[0]["finalTier"] if rows else None
 
     def record_feedback(self, decision_id, rating, ts_ms) -> bool:
         if decision_id not in self.decisions:
@@ -169,6 +180,60 @@ def test_healthz_reports_classifier():
         ]
         == "heuristic"
     )
+
+
+def test_snap_to_available_walks_up_then_down():
+    assert snap_to_available("c2", ["c0", "c1", "c2", "c3"]) == "c2"
+    assert snap_to_available("c2", ["c1", "c3"]) == "c3"  # up, never silent downgrade
+    assert snap_to_available("c3", ["c0", "c1"]) == "c1"  # nothing above -> highest below
+    assert snap_to_available("c1", []) == "c1"
+
+
+def test_apply_sticky_blocks_only_short_turn_downgrades():
+    cfg = {"enabled": True, "maxUserLen": 200}
+    # short continuation + downgrade -> held on the warm tier
+    assert apply_sticky("c0", "c2", 5, cfg) == ("c2", True)
+    # long turn is not a continuation -> downgrade allowed
+    assert apply_sticky("c0", "c2", 1_500, cfg) == ("c0", False)
+    # upgrades always pass (a harder turn is worth the cache miss)
+    assert apply_sticky("c3", "c0", 5, cfg) == ("c3", False)
+    # no history / disabled -> no-op
+    assert apply_sticky("c0", None, 5, cfg) == ("c0", False)
+    assert apply_sticky("c0", "c2", 5, {"enabled": False}) == ("c0", False)
+
+
+def test_route_applies_sticky_across_turns():
+    central = make_central(classifier=FakeClassifier(tier="c2", route_class="R2"))
+    first = central.handle("POST", "/v1/route", {}, route_body("排查这个报错"), None)[1]
+    assert first["tier"] == "c2"
+
+    # Same session, short follow-up that the classifier would put at c0:
+    # sticky must hold it on c2 to keep the prompt cache warm.
+    central.classifier = FakeClassifier(tier="c0", route_class="R0")
+    body = {**route_body("继续"), "sessionKey": "s1"}
+    status, second = central.handle("POST", "/v1/route", {}, body, None)
+    assert status == 200
+    assert second["tier"] == "c2"
+    assert second["meta"]["stuck"] is True
+    assert second["meta"]["classifierTier"] == "c0"
+    # The trail records the SERVED tier, so it stays a truthful training label.
+    assert central.store.get_decision(second["decisionId"])["finalTier"] == "c2"
+
+
+def test_route_snaps_to_client_available_tiers():
+    central = make_central(classifier=FakeClassifier(tier="c2", route_class="R2"))
+    body = {**route_body("hi"), "availableTiers": ["c1", "c3"]}
+    tier = central.handle("POST", "/v1/route", {}, body, None)[1]["tier"]
+    assert tier == "c3"  # c2 unavailable -> up, never down to c1
+
+
+def test_image_turn_bypasses_classifier_to_strongest_tier():
+    central = make_central(classifier=FakeClassifier(tier="c0", route_class="R0"))
+    body = {**route_body("看看这张图"), "hasImage": True, "availableTiers": ["c0", "c2"]}
+    status, resp = central.handle("POST", "/v1/route", {}, body, None)
+    assert status == 200
+    assert resp["tier"] == "c2"
+    assert resp["meta"]["band"] == "image"
 
 
 def test_validates_route_body():
@@ -301,6 +366,8 @@ def _decision_record(decision_id="d-1", tenant="t1", final="c2", band="semantic"
         "baseTier": "c0",
         "gatedTier": "c0",
         "finalTier": final,
+        "classifierTier": final,
+        "stuck": False,
         "confidence": 0.9,
         "margin": 0.4,
         "probabilities": {"c0": 0.7, "c1": 0.1, "c2": 0.15, "c3": 0.05},
@@ -329,21 +396,22 @@ def test_mysqlstore_insert_placeholder_and_param_order(monkeypatch):
     store.insert_decision(_decision_record())
     insert = next(c for c in conn.calls if c[0].startswith("INSERT INTO decisions"))
     sql, params = insert
-    assert sql.count("%s") == 19
-    assert len(params) == 19
+    assert sql.count("%s") == 21
+    assert len(params) == 21
     assert params[0] == "d-1"  # decision_id first
     assert params[3] == "squilla/auto"  # profile after session_key
-    assert json.loads(params[11]) == {"c0": 0.7, "c1": 0.1, "c2": 0.15, "c3": 0.05}
-    assert json.loads(params[18]) == [0.1, 0.2]  # embedding last
+    assert json.loads(params[13]) == {"c0": 0.7, "c1": 0.1, "c2": 0.15, "c3": 0.05}
+    assert json.loads(params[20]) == [0.1, 0.2]  # embedding last
     assert conn.committed == 1
 
 
 def test_mysqlstore_get_maps_row_to_summary(monkeypatch):
     conn = _FakeConn()
     store = _make_store(monkeypatch, conn)
-    # 18 summary columns in _SUMMARY_COLUMNS order, then the rating lookup row.
+    # 20 summary columns in _SUMMARY_COLUMNS order, then the rating lookup row.
     row = (
-        "d-1", "t1", "s1", "squilla/auto", 1000, "semantic", "c0", "c0", "c2", 0.9, 0.4,
+        "d-1", "t1", "s1", "squilla/auto", 1000, "semantic", "c0", "c0", "c2",
+        "c2", 0, 0.9, 0.4,
         json.dumps({"c0": 0.7, "c1": 0.1, "c2": 0.15, "c3": 0.05}),
         json.dumps({"highRisk": True}), 12, 0,
         json.dumps([{"text": "谢谢", "similarity": 0.8}]), "v1", 5,
