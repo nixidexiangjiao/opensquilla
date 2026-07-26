@@ -65,11 +65,13 @@ the message (never the message). Those are what turn a stream of decisions into
 a trainable corpus; ``/v1/train/export`` emits them in RouterTrainSample shape.
 
 Operator bias: ``SQUILLA_TIER_BIAS`` holds JSON rules that reweight the model's
-tier probabilities (e.g. "make c3 twice as likely 09:00-18:00"). A turn whose
-served tier an active rule actually moved is marked ``tainted`` and never
-leaves the export — a manual decision must not come back as a learned label.
-Taint propagates through sticky, so the turn after a biased one is excluded too
-when it was held on the biased tier.
+tier probabilities, scoped by three ANDed dimensions — ``tenants``,
+``profiles``, and a UTC ``hours`` window (e.g. "make c3 three times as likely
+for team-a on squilla/auto during business hours"). A turn whose served tier an
+active rule actually moved is marked ``tainted`` and never leaves the export —
+a manual decision must not come back as a learned label. Taint propagates
+through sticky, so the turn after a biased one is excluded too when it was held
+on the biased tier.
 """
 
 from __future__ import annotations
@@ -278,16 +280,22 @@ class BiasRule:
 
     ``weights`` multiplies the per-tier probabilities before the tier is picked,
     so an operator can say "make c3 twice as likely between 09:00 and 18:00".
-    Scope is an optional UTC hour window (wraps midnight) and an optional
-    profile set; an unscoped rule applies to every turn.
+
+    Scope is three independent dimensions, ANDed: tenant, profile, and a UTC
+    hour window (may wrap midnight). An empty set means "any" on that
+    dimension, so a rule with no scope at all applies to every turn — write the
+    narrow rules first, since the first match wins.
     """
 
     name: str
     weights: dict[str, float]
     hours: tuple[int, int] | None = None
+    tenants: frozenset[str] = frozenset()
     profiles: frozenset[str] = frozenset()
 
-    def matches(self, profile: str, hour: int) -> bool:
+    def matches(self, tenant_id: str, profile: str, hour: int) -> bool:
+        if self.tenants and tenant_id not in self.tenants:
+            return False
         if self.profiles and profile not in self.profiles:
             return False
         if self.hours is None:
@@ -301,9 +309,10 @@ def parse_bias_rules(raw: str | None) -> list[BiasRule]:
     """Parse ``SQUILLA_TIER_BIAS`` (a JSON list) into rules; bad entries drop.
 
     Shape: ``[{"name": "peak-c3", "weights": {"c3": 2.0}, "hours": [1, 10],
-    "profiles": ["squilla/auto"]}]``. Malformed entries are skipped with a
-    warning rather than failing startup — a broken bias rule must never take
-    routing down with it.
+    "tenants": ["team-a"], "profiles": ["squilla/auto"]}]``. ``hours``,
+    ``tenants``, and ``profiles`` are each optional and each defaults to "any".
+    Malformed entries are skipped with a warning rather than failing startup —
+    a broken bias rule must never take routing down with it.
     """
     if not raw or not raw.strip():
         return []
@@ -340,27 +349,29 @@ def parse_bias_rules(raw: str | None) -> list[BiasRule]:
                 start = end = 0
             if start != end:
                 hours = (start, end)
-        raw_profiles = entry.get("profiles")
-        profiles = (
-            frozenset(str(p) for p in raw_profiles)
-            if isinstance(raw_profiles, list)
-            else frozenset()
-        )
         rules.append(
             BiasRule(
                 name=str(entry.get("name") or f"rule-{index}"),
                 weights=weights,
                 hours=hours,
-                profiles=profiles,
+                tenants=_scope_set(entry.get("tenants")),
+                profiles=_scope_set(entry.get("profiles")),
             )
         )
     return rules
 
 
-def match_bias_rule(rules: list[BiasRule], profile: str, hour: int) -> BiasRule | None:
+def _scope_set(raw: Any) -> frozenset[str]:
+    """A scope list -> set; anything else means "unscoped" (matches any)."""
+    return frozenset(str(item) for item in raw) if isinstance(raw, list) else frozenset()
+
+
+def match_bias_rule(
+    rules: list[BiasRule], tenant_id: str, profile: str, hour: int
+) -> BiasRule | None:
     """First matching rule wins, so order in config is the precedence order."""
     for rule in rules:
-        if rule.matches(profile, hour):
+        if rule.matches(tenant_id, profile, hour):
             return rule
     return None
 
@@ -1080,6 +1091,7 @@ class Central:
             if has_image
             else match_bias_rule(
                 self.bias_rules,
+                tenant_id,
                 profile,
                 datetime.fromtimestamp(started / 1000, tz=UTC).hour,
             )

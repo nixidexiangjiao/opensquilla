@@ -377,7 +377,13 @@ def test_parse_bias_rules_skips_malformed_entries():
     rules = parse_bias_rules(
         json.dumps(
             [
-                {"name": "ok", "weights": {"c3": 2.0}, "hours": [9, 18], "profiles": ["p"]},
+                {
+                    "name": "ok",
+                    "weights": {"c3": 2.0},
+                    "hours": [9, 18],
+                    "tenants": ["team-a"],
+                    "profiles": ["p"],
+                },
                 {"name": "no-weights", "weights": {}},
                 {"name": "bad-tier", "weights": {"c9": 2.0}},
                 "not-a-dict",
@@ -385,25 +391,54 @@ def test_parse_bias_rules_skips_malformed_entries():
         )
     )
     assert [r.name for r in rules] == ["ok"]
-    assert rules[0].hours == (9, 18) and rules[0].profiles == frozenset({"p"})
+    assert rules[0].hours == (9, 18)
+    assert rules[0].tenants == frozenset({"team-a"})
+    assert rules[0].profiles == frozenset({"p"})
     assert parse_bias_rules(None) == [] and parse_bias_rules("{oops") == []
 
 
-def test_bias_rule_scoping_by_hour_and_profile():
+def test_parse_bias_rules_omitted_scope_means_any():
+    rule = parse_bias_rules(json.dumps([{"name": "global", "weights": {"c3": 2.0}}]))[0]
+    assert rule.hours is None
+    assert rule.tenants == frozenset() and rule.profiles == frozenset()
+    assert rule.matches("any-tenant", "any-profile", 3) is True
+
+
+def test_bias_rule_scoping_is_tenant_and_profile_and_hour():
     windowed = BiasRule(name="day", weights={"c3": 2.0}, hours=(9, 18))
-    assert windowed.matches("any", 12) is True
-    assert windowed.matches("any", 20) is False
+    assert windowed.matches("t1", "any", 12) is True
+    assert windowed.matches("t1", "any", 20) is False
     # A window may wrap midnight.
     night = BiasRule(name="night", weights={"c0": 2.0}, hours=(22, 6))
-    assert night.matches("any", 23) is True and night.matches("any", 3) is True
-    assert night.matches("any", 12) is False
+    assert night.matches("t1", "any", 23) is True and night.matches("t1", "any", 3) is True
+    assert night.matches("t1", "any", 12) is False
 
-    scoped = BiasRule(name="scoped", weights={"c3": 2.0}, profiles=frozenset({"squilla/auto"}))
-    assert scoped.matches("squilla/auto", 0) is True
-    assert scoped.matches("other", 0) is False
+    tenant_scoped = BiasRule(name="t", weights={"c3": 2.0}, tenants=frozenset({"team-a"}))
+    assert tenant_scoped.matches("team-a", "any", 0) is True
+    assert tenant_scoped.matches("team-b", "any", 0) is False
+
+    profile_scoped = BiasRule(
+        name="p", weights={"c3": 2.0}, profiles=frozenset({"squilla/auto"})
+    )
+    assert profile_scoped.matches("t1", "squilla/auto", 0) is True
+    assert profile_scoped.matches("t1", "other", 0) is False
+
+    # The three dimensions are ANDed: every one must match.
+    narrow = BiasRule(
+        name="narrow",
+        weights={"c3": 2.0},
+        hours=(9, 18),
+        tenants=frozenset({"team-a"}),
+        profiles=frozenset({"squilla/auto"}),
+    )
+    assert narrow.matches("team-a", "squilla/auto", 12) is True
+    assert narrow.matches("team-b", "squilla/auto", 12) is False
+    assert narrow.matches("team-a", "other", 12) is False
+    assert narrow.matches("team-a", "squilla/auto", 20) is False
+
     # First match wins, so config order is precedence order.
-    assert match_bias_rule([night, windowed], "any", 12).name == "day"
-    assert match_bias_rule([night], "any", 12) is None
+    assert match_bias_rule([night, windowed], "t1", "any", 12).name == "day"
+    assert match_bias_rule([night], "t1", "any", 12) is None
 
 
 def test_apply_tier_bias_shifts_relative_to_the_classifier_tier():
@@ -433,6 +468,31 @@ def test_bias_preserves_postprocess_and_records_the_rule():
     assert resp["tier"] == "c3"  # argmax c0 -> c2 is +2, applied to c1
     assert resp["meta"]["biasRule"] == "peak"
     assert resp["meta"]["tainted"] is True
+
+
+def test_route_scopes_bias_by_tenant_profile_and_time_window():
+    # 09:00 UTC on 2024-01-01, so the rule's hour window is exercised for real
+    # rather than through the matcher alone.
+    nine_am = 1_704_099_600_000
+    rule = BiasRule(
+        name="peak",
+        weights={"c3": 10.0},
+        hours=(9, 18),
+        tenants=frozenset({"t1"}),
+        profiles=frozenset({"squilla/auto"}),
+    )
+    central = make_central(bias_rules=[rule], now_ms=lambda: nine_am)
+
+    def bias_for(**overrides) -> str:
+        body = {**route_body("hi"), **overrides}
+        return central.handle("POST", "/v1/route", {}, body, None)[1]["meta"]["biasRule"]
+
+    assert bias_for() == "peak"
+    assert bias_for(tenantId="t2") == ""  # other tenant
+    assert bias_for(profile="squilla/auto-max") == ""  # other profile
+
+    central.now_ms = lambda: nine_am + 10 * 3_600_000  # 19:00 UTC, outside window
+    assert bias_for() == ""
 
 
 def test_unbiased_turn_is_not_tainted_even_with_a_rule_active():
