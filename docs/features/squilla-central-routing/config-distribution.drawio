@@ -1,0 +1,80 @@
+<mxfile host="65bd71144e">
+    <diagram name="Config Distribution" id="squilla-cfg">
+        <mxGraphModel dx="1275" dy="791" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="826" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="title" value="配置下发 — tokenhub 只喂中央；插件配置走 openclaw.json" style="text;html=1;fontSize=17;fontStyle=1;align=left;" parent="1" vertex="1">
+                    <mxGeometry x="40" y="20" width="760" height="30" as="geometry"/>
+                </mxCell>
+                <mxCell id="labelC" value="中央服务（每实例 · configSource）" style="text;html=1;fontSize=12;fontStyle=1;fontColor=#82b366;align=left;" parent="1" vertex="1">
+                    <mxGeometry x="240" y="250" width="320" height="20" as="geometry"/>
+                </mxCell>
+                <mxCell id="operator" value="运维 / CI&#xa;编辑策略包 → policyVersion bump" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" parent="1" vertex="1">
+                    <mxGeometry x="380" y="80" width="220" height="56" as="geometry"/>
+                </mxCell>
+                <mxCell id="tokenhub" value="tokenhub（内部中控）· 按 tenant 存版本化策略配置" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;verticalAlign=top;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="240" y="166" width="500" height="66" as="geometry"/>
+                </mxCell>
+                <mxCell id="th_b" value="策略包：后处理阈值 / margin / 安全网 / 粘滞参数 / 默认档 / 管控规则集 · policyVersion" style="text;html=1;fontSize=10;align=left;spacingLeft=8;spacingTop=2;" parent="1" vertex="1">
+                    <mxGeometry x="248" y="198" width="484" height="28" as="geometry"/>
+                </mxCell>
+                <mxCell id="c_pull" value="后台定时拉取(≈30s)&#xa;GET /config/policy?tenant=…" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="345" y="276" width="290" height="44" as="geometry"/>
+                </mxCell>
+                <mxCell id="c_valid" value="校验通过？&#xa;(schema)" style="rhombus;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="395" y="346" width="190" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="c_swap" value="原子替换单槽快照" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="345" y="456" width="290" height="40" as="geometry"/>
+                </mxCell>
+                <mxCell id="c_keep" value="保留 last-known-good&#xa;+ 告警（fail-open）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="680" y="356" width="190" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="c_hot" value="热路径 Central._route&#xa;只读当前快照（绝不 per-turn 拉取）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="345" y="526" width="290" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="c_boot" value="兜底：SQUILLA_* env + SQUILLA_POLICY_FILE&#xa;（引导 + tokenhub 不可达时）" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;" parent="1" vertex="1">
+                    <mxGeometry x="680" y="526" width="190" height="50" as="geometry"/>
+                </mxCell>
+                <mxCell id="trail" value="decisionId 决策轨迹（MySQL · 无明文）记 policyVersion&#xa;→ 任意一次路由都能回放它当时用的是哪版策略（可复现 / 可回滚）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" parent="1" vertex="1">
+                    <mxGeometry x="255" y="616" width="470" height="56" as="geometry"/>
+                </mxCell>
+                <mxCell id="pluginNote" value="OpenClaw 插件（fleet）· 纯透传&#xa;配置 = openclaw.json&#xa;（tiers / defaultTier / central 端点）&#xa;&#xa;· 启动读一次 · 不经 tokenhub&#xa;· 无中控快照 · 无 sticky 配置&#xa;· 无策略可下发：插件已无判定逻辑&#xa;· 改 fleet 模型映射 = 用配置管理/&#xa;  发布流程推 openclaw.json" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;verticalAlign=top;spacingTop=8;align=left;spacingLeft=10;" parent="1" vertex="1">
+                    <mxGeometry x="910" y="166" width="240" height="185" as="geometry"/>
+                </mxCell>
+                <mxCell id="splitNote" value="所有者划分：&#xa;热改（策略/阈值/粘滞）→ tokenhub → 中央&#xa;冷改（虚拟 id ↔ 真实模型）→ openclaw.json → 插件" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;align=left;spacingLeft=10;verticalAlign=top;spacingTop=6;" parent="1" vertex="1">
+                    <mxGeometry x="910" y="371" width="240" height="80" as="geometry"/>
+                </mxCell>
+                <mxCell id="g1" value="发布" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;fontSize=10;" parent="1" source="operator" target="tokenhub" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="g3" value="下发策略包（只给中央）" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;fontSize=10;strokeColor=#d6b656;" parent="1" source="tokenhub" target="c_pull" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="g9" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;" parent="1" source="c_pull" target="c_valid" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="g10" value="是" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;fontSize=10;" parent="1" source="c_valid" target="c_swap" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="g11" value="否" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;fontSize=10;" parent="1" source="c_valid" target="c_keep" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="g12" value="更新快照" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;fontSize=10;" parent="1" source="c_swap" target="c_hot" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="g13" value="沿用旧快照" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;dashed=1;fontSize=10;" parent="1" source="c_keep" target="c_hot" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="775" y="551"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="g15" value="policyVersion" style="edgeStyle=orthogonalEdgeStyle;html=1;endArrow=block;dashed=1;fontSize=10;" parent="1" source="c_hot" target="trail" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

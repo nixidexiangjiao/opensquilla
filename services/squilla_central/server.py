@@ -56,6 +56,7 @@ Wire contract (mirrored by the OpenClaw plugin's central-client.ts):
     GET  /v1/stats?tenantId
     GET  /v1/train/export?tenantId&sinceMs&limit
                         -> {samples: [...RouterTrainSample...], count}
+    GET  /v1/policy | POST /v1/policy/reload | POST /v1/policy/simulate
     GET  /healthz
 
 Self-learning capture: every classified turn stores the exact 390-dim feature
@@ -64,14 +65,15 @@ class, a per-session ``turn_index``, and a ``complaint`` boolean derived from
 the message (never the message). Those are what turn a stream of decisions into
 a trainable corpus; ``/v1/train/export`` emits them in RouterTrainSample shape.
 
-Operator bias: ``SQUILLA_TIER_BIAS`` holds JSON rules that reweight the model's
-tier probabilities, scoped by three ANDed dimensions — ``tenants``,
-``profiles``, and a UTC ``hours`` window (e.g. "make c3 three times as likely
-for team-a on squilla/auto during business hours"). A turn whose served tier an
-active rule actually moved is marked ``tainted`` and never leaves the export —
-a manual decision must not come back as a learned label. Taint propagates
-through sticky, so the turn after a biased one is excluded too when it was held
-on the biased tier.
+Operator control: see ``policy.py``. Rules can nudge the tier probabilities or
+hard-bound the served tier (floor/ceiling/pin), scoped by tenant, profile, UTC
+hour window, validity dates, and a rollout ratio, with dry-run and per-rule
+impact counters. A turn whose SERVED tier a live rule actually moved is marked
+``tainted`` and never leaves the training export — a manual decision must not
+come back as a learned label. Taint propagates through sticky, so the turn
+after an overridden one is excluded too when it was held on that tier.
+
+Design doc: docs/features/squilla-central-routing.md
 """
 
 from __future__ import annotations
@@ -90,6 +92,15 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from services.squilla_central.policy import (
+    PolicyRule,
+    PolicySource,
+    build_policy_source,
+    clamp_candidates,
+    select_rule,
+    shift_by_weights,
+)
 
 TEXT_TIERS = ("c0", "c1", "c2", "c3")
 ROUTE_CLASSES = ("R0", "R1", "R2", "R3")
@@ -274,132 +285,6 @@ def snap_to_available(tier: str, available: list[str]) -> str:
     return available[0]
 
 
-@dataclass(frozen=True)
-class BiasRule:
-    """One operator override of the model's tier probabilities.
-
-    ``weights`` multiplies the per-tier probabilities before the tier is picked,
-    so an operator can say "make c3 twice as likely between 09:00 and 18:00".
-
-    Scope is three independent dimensions, ANDed: tenant, profile, and a UTC
-    hour window (may wrap midnight). An empty set means "any" on that
-    dimension, so a rule with no scope at all applies to every turn — write the
-    narrow rules first, since the first match wins.
-    """
-
-    name: str
-    weights: dict[str, float]
-    hours: tuple[int, int] | None = None
-    tenants: frozenset[str] = frozenset()
-    profiles: frozenset[str] = frozenset()
-
-    def matches(self, tenant_id: str, profile: str, hour: int) -> bool:
-        if self.tenants and tenant_id not in self.tenants:
-            return False
-        if self.profiles and profile not in self.profiles:
-            return False
-        if self.hours is None:
-            return True
-        start, end = self.hours
-        # A window may wrap midnight (22->6), so the wrapped case is a union.
-        return start <= hour < end if start < end else (hour >= start or hour < end)
-
-
-def parse_bias_rules(raw: str | None) -> list[BiasRule]:
-    """Parse ``SQUILLA_TIER_BIAS`` (a JSON list) into rules; bad entries drop.
-
-    Shape: ``[{"name": "peak-c3", "weights": {"c3": 2.0}, "hours": [1, 10],
-    "tenants": ["team-a"], "profiles": ["squilla/auto"]}]``. ``hours``,
-    ``tenants``, and ``profiles`` are each optional and each defaults to "any".
-    Malformed entries are skipped with a warning rather than failing startup —
-    a broken bias rule must never take routing down with it.
-    """
-    if not raw or not raw.strip():
-        return []
-    try:
-        entries = json.loads(raw)
-    except ValueError as exc:
-        print(f"squilla-central: SQUILLA_TIER_BIAS is not valid JSON ({exc}); ignoring")
-        return []
-    if not isinstance(entries, list):
-        print("squilla-central: SQUILLA_TIER_BIAS must be a JSON list; ignoring")
-        return []
-
-    rules: list[BiasRule] = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            continue
-        raw_weights = entry.get("weights")
-        if not isinstance(raw_weights, dict):
-            continue
-        weights = {
-            tier: float(value)
-            for tier, value in raw_weights.items()
-            if tier in TEXT_TIERS and isinstance(value, (int, float)) and float(value) > 0
-        }
-        if not weights:
-            print(f"squilla-central: bias rule #{index} has no usable weights; ignoring")
-            continue
-        raw_hours = entry.get("hours")
-        hours: tuple[int, int] | None = None
-        if isinstance(raw_hours, list) and len(raw_hours) == 2:
-            try:
-                start, end = int(raw_hours[0]) % 24, int(raw_hours[1]) % 24
-            except (TypeError, ValueError):
-                start = end = 0
-            if start != end:
-                hours = (start, end)
-        rules.append(
-            BiasRule(
-                name=str(entry.get("name") or f"rule-{index}"),
-                weights=weights,
-                hours=hours,
-                tenants=_scope_set(entry.get("tenants")),
-                profiles=_scope_set(entry.get("profiles")),
-            )
-        )
-    return rules
-
-
-def _scope_set(raw: Any) -> frozenset[str]:
-    """A scope list -> set; anything else means "unscoped" (matches any)."""
-    return frozenset(str(item) for item in raw) if isinstance(raw, list) else frozenset()
-
-
-def match_bias_rule(
-    rules: list[BiasRule], tenant_id: str, profile: str, hour: int
-) -> BiasRule | None:
-    """First matching rule wins, so order in config is the precedence order."""
-    for rule in rules:
-        if rule.matches(tenant_id, profile, hour):
-            return rule
-    return None
-
-
-def apply_tier_bias(
-    probabilities: dict[str, float], classifier_tier: str, rule: BiasRule
-) -> str:
-    """Shift the classifier's tier by the bias rule's effect on the argmax.
-
-    The bias is applied as a DELTA, not as an absolute re-selection: we compare
-    argmax(probabilities) against argmax(weighted probabilities) and move the
-    classifier's tier by that many steps. Re-running argmax outright would throw
-    away the model's postprocess (margin upgrade, under-routing safety net),
-    silently regressing turns the operator never meant to touch.
-    """
-    if classifier_tier not in TEXT_TIERS:
-        return classifier_tier
-    ranked = [float(probabilities.get(tier, 0.0)) for tier in TEXT_TIERS]
-    if not any(ranked):
-        return classifier_tier  # bypass turns carry no distribution to bias
-    weighted = [p * rule.weights.get(tier, 1.0) for p, tier in zip(ranked, TEXT_TIERS)]
-    shift = weighted.index(max(weighted)) - ranked.index(max(ranked))
-    if shift == 0:
-        return classifier_tier
-    moved = min(max(TEXT_TIERS.index(classifier_tier) + shift, 0), len(TEXT_TIERS) - 1)
-    return TEXT_TIERS[moved]
-
-
 def apply_sticky(
     desired: str, last_tier: str | None, prompt_len: int, sticky: dict[str, Any]
 ) -> tuple[str, bool]:
@@ -421,6 +306,50 @@ def apply_sticky(
     if TEXT_TIERS.index(last_tier) <= TEXT_TIERS.index(desired):
         return desired, False
     return last_tier, True
+
+
+@dataclass(frozen=True)
+class TierPlan:
+    """The tail of the decision: what gets served, and why it moved."""
+
+    tier: str
+    stuck: bool
+    clamp_satisfiable: bool = True
+
+
+def plan_tier(
+    *,
+    classifier_tier: str,
+    probabilities: dict[str, float],
+    available: list[str],
+    rule: PolicyRule | None,
+    last_tier: str | None,
+    prompt_len: int,
+    sticky: dict[str, Any],
+) -> TierPlan:
+    """Run the post-classifier chain: policy -> snap -> sticky.
+
+    Called twice per turn — once with ``rule=None`` for the baseline the model
+    alone would have produced, once with the matched rule. Comparing the two
+    outcomes is what defines "this turn was intervened on"; comparing an
+    intermediate tier would mislabel turns where the rule nudged something that
+    snap or sticky then collapsed back.
+
+    A rule's floor/ceiling narrows the candidate SET before snap and sticky, so
+    neither can escape the bound: snap only picks from the band, and sticky can
+    only hold a previous tier that has been pulled into it.
+    """
+    desired = classifier_tier
+    candidates, satisfiable = list(available), True
+    if rule is not None:
+        desired = shift_by_weights(probabilities, desired, rule.action.weights)
+        candidates, satisfiable = clamp_candidates(
+            available, rule.action.floor, rule.action.ceiling
+        )
+    desired = snap_to_available(desired, candidates)
+    previous = snap_to_available(last_tier, candidates) if last_tier else None
+    served, stuck = apply_sticky(desired, previous, prompt_len, sticky)
+    return TierPlan(tier=served, stuck=stuck, clamp_satisfiable=satisfiable)
 
 
 def classify_heuristic(message: str, attachment_count: int) -> dict[str, Any]:
@@ -582,6 +511,8 @@ CREATE TABLE IF NOT EXISTS decisions (
   features_b64 LONGTEXT NULL,
   raw_bge_b64 LONGTEXT NULL,
   bias_rule VARCHAR(64) NOT NULL DEFAULT '',
+  bias_mode VARCHAR(16) NOT NULL DEFAULT '',
+  baseline_tier VARCHAR(8) NOT NULL DEFAULT '',
   tainted TINYINT(1) NOT NULL DEFAULT 0,
   INDEX idx_decisions_session (tenant_id, session_key, ts_ms),
   INDEX idx_decisions_export (tenant_id, tainted, ts_ms)
@@ -598,6 +529,8 @@ _DECISION_COLUMN_ADDITIONS = (
     ("features_b64", "LONGTEXT NULL"),
     ("raw_bge_b64", "LONGTEXT NULL"),
     ("bias_rule", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("bias_mode", "VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("baseline_tier", "VARCHAR(8) NOT NULL DEFAULT ''"),
     ("tainted", "TINYINT(1) NOT NULL DEFAULT 0"),
 )
 _DDL_FEEDBACK = """
@@ -612,7 +545,7 @@ _SUMMARY_COLUMNS = (
     "decision_id, tenant_id, session_key, profile, ts_ms, band, base_tier, gated_tier, "
     "final_tier, classifier_tier, stuck, confidence, margin, probabilities, flags, char_len, "
     "attachment_count, top_anchors, policy_version, latency_ms, turn_index, route_class, "
-    "complaint, bias_rule, tainted"
+    "complaint, bias_rule, bias_mode, baseline_tier, tainted"
 )
 # Ordered to match RouterTrainSample's field names so an exported row feeds
 # opensquilla's offline builder without a translation layer.
@@ -628,7 +561,7 @@ _INSERT_COLUMNS = (
     "final_tier, classifier_tier, stuck, confidence, margin, probabilities, flags, char_len, "
     "attachment_count, top_anchors, policy_version, latency_ms, embedding, turn_index, "
     "route_class, complaint, feature_schema_version, features_b64, raw_bge_b64, bias_rule, "
-    "tainted"
+    "bias_mode, baseline_tier, tainted"
 )
 
 
@@ -756,6 +689,8 @@ class MySqlStore:
             record["featuresB64"],
             record["rawBgeB64"],
             record["biasRule"],
+            record["biasMode"],
+            record["baselineTier"],
             int(bool(record["tainted"])),
         )
         with self._lock, self._cursor() as cursor:
@@ -793,7 +728,9 @@ class MySqlStore:
             "routeClass": row[21],
             "complaint": bool(row[22]),
             "biasRule": row[23],
-            "tainted": bool(row[24]),
+            "biasMode": row[24],
+            "baselineTier": row[25],
+            "tainted": bool(row[26]),
             "rating": rating,
         }
 
@@ -921,6 +858,17 @@ class MySqlStore:
                 (tenant_id,),
             )
             total, captured, tainted, complaints, trainable = cursor.fetchone() or (0, 0, 0, 0, 0)
+            # Per-rule impact: how often each rule fired, and how often it
+            # actually moved the tier. A rule that fires constantly but never
+            # changes anything is dead weight; one that changes everything is
+            # probably too broad. Both are invisible without this breakdown.
+            cursor.execute(
+                "SELECT bias_rule, bias_mode, COUNT(*), SUM(final_tier <> baseline_tier) "
+                "FROM decisions WHERE tenant_id = %s AND bias_rule <> '' "
+                "GROUP BY bias_rule, bias_mode",
+                (tenant_id,),
+            )
+            rule_rows = cursor.fetchall()
         return {
             "tiers": {row[0]: row[1] for row in tiers},
             "bands": {row[0]: row[1] for row in bands},
@@ -933,6 +881,15 @@ class MySqlStore:
                 "complaints": int(complaints or 0),
                 "trainable": int(trainable or 0),
             },
+            "rules": [
+                {
+                    "rule": row[0],
+                    "mode": row[1],
+                    "matched": int(row[2] or 0),
+                    "changed": int(row[3] or 0),
+                }
+                for row in rule_rows
+            ],
         }
 
     def close(self) -> None:
@@ -952,7 +909,7 @@ class Central:
         classifier: Any = None,  # V4Classifier (or a fake); None → heuristic fallback
         default_tier: str = "c1",
         sticky: dict[str, Any] | None = None,
-        bias_rules: list[BiasRule] | None = None,
+        policy: PolicySource | None = None,
         policy_version: str = "central-py-v1",
         token: str | None = None,
         now_ms: Any = None,
@@ -967,7 +924,7 @@ class Central:
         # Operator tier-probability overrides. Any turn one of these actually
         # moves is marked tainted and excluded from training export — a manual
         # decision must never come back as a learned label.
-        self.bias_rules = bias_rules or []
+        self.policy = policy if policy is not None else PolicySource()
         self.default_tier = default_tier
         self.policy_version = policy_version
         self.token = token
@@ -1012,7 +969,71 @@ class Central:
             return 200, self.store.stats(tenant_id)
         if path == "/v1/train/export" and method == "GET":
             return self._export(query)
+        if path == "/v1/policy" and method == "GET":
+            # What is live right now, including rules rejected at load. Ops must
+            # be able to confirm the running policy without shelling into a box.
+            return 200, self.policy.snapshot.summary()
+        if path == "/v1/policy/reload" and method == "POST":
+            # Manual reload for "I just pushed the file and want it now"; the
+            # background watcher would pick it up anyway.
+            self.policy.reload()
+            return 200, self.policy.snapshot.summary()
+        if path == "/v1/policy/simulate" and method == "POST":
+            return self._simulate(body)
         return 404, {"error": "not found"}
+
+    def _simulate(self, body: Any) -> tuple[int, dict[str, Any]]:
+        """Answer "which rule would fire, and what would it do?" without routing.
+
+        The safety net for an ops surface: a floor/ceiling/pin is a blunt
+        instrument, and an operator needs to check a rule against a concrete
+        tenant/profile/time before it reaches real traffic — including rules
+        that are still disabled or dry-run.
+        """
+        if not isinstance(body, dict):
+            return 400, {"error": "body must be a JSON object"}
+        tenant_id = body.get("tenantId")
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            return 400, {"error": "tenantId is required"}
+        tier = body.get("classifierTier") if body.get("classifierTier") in TEXT_TIERS else "c1"
+        raw_available = body.get("availableTiers")
+        available = (
+            [t for t in raw_available if t in TEXT_TIERS]
+            if isinstance(raw_available, list)
+            else list(TEXT_TIERS)
+        ) or list(TEXT_TIERS)
+        at_ms = body.get("atMs") if isinstance(body.get("atMs"), (int, float)) else self.now_ms()
+        probabilities = (
+            body.get("probabilities")
+            if isinstance(body.get("probabilities"), dict)
+            else {t: (1.0 if t == tier else 0.0) for t in TEXT_TIERS}
+        )
+
+        rule = select_rule(
+            self.policy.snapshot.rules,
+            tenant_id=tenant_id,
+            profile=str(body.get("profile") or ""),
+            session_key=str(body.get("sessionKey") or ""),
+            now_ms=int(at_ms),
+        )
+        shared = {
+            "classifier_tier": tier,
+            "probabilities": probabilities,
+            "available": available,
+            "last_tier": body.get("lastTier") if body.get("lastTier") in TEXT_TIERS else None,
+            "prompt_len": int(body.get("charLen") or 0),
+            "sticky": self.sticky,
+        }
+        baseline = plan_tier(rule=None, **shared)
+        proposed = plan_tier(rule=rule, **shared) if rule is not None else baseline
+        return 200, {
+            "rule": rule.summary() if rule is not None else None,
+            "baselineTier": baseline.tier,
+            "proposedTier": proposed.tier,
+            "servedTier": baseline.tier if (rule and rule.dry_run) else proposed.tier,
+            "changed": proposed.tier != baseline.tier,
+            "clampUnsatisfiable": not proposed.clamp_satisfiable,
+        }
 
     def _export(self, query: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
         """Training corpus for one tenant, already stripped of biased turns.
@@ -1083,36 +1104,56 @@ class Central:
             outcome = classify_heuristic(message, attachment_count)
 
         # Client is pass-through, so every remaining judgment happens here:
-        # operator bias -> snap onto a servable tier -> KV-cache sticky against
+        # operator policy -> snap onto a servable tier -> KV-cache sticky against
         # the tier this session was actually served last turn.
         classifier_tier = outcome["final_tier"]
+        previous = self.store.last_decision(tenant_id, session_key)
+        last_tier = previous["tier"] if previous else None
+        # Image turns never reach the classifier, so there is no model judgment
+        # for a rule to adjust; leaving them out keeps "vision needs vision" a
+        # property of the service rather than something a rule can break.
         rule = (
             None
             if has_image
-            else match_bias_rule(
-                self.bias_rules,
-                tenant_id,
-                profile,
-                datetime.fromtimestamp(started / 1000, tz=UTC).hour,
+            else select_rule(
+                self.policy.snapshot.rules,
+                tenant_id=tenant_id,
+                profile=profile,
+                session_key=session_key,
+                now_ms=started,
             )
         )
-        biased_tier = (
-            apply_tier_bias(outcome["probabilities"], classifier_tier, rule)
-            if rule is not None
-            else classifier_tier
-        )
-        desired = snap_to_available(biased_tier, available)
-        previous = self.store.last_decision(tenant_id, session_key)
-        last_tier = previous["tier"] if previous else None
-        served, stuck = apply_sticky(desired, last_tier, len(message), self.sticky)
 
-        # Taint marks a turn whose served tier reflects an operator decision
-        # rather than the model's. It propagates through sticky: a turn held on
-        # a biased tier was also not chosen by the model, and training on it
-        # would launder the override back in as a label one turn later.
-        tainted = biased_tier != classifier_tier or bool(
-            stuck and previous is not None and previous["tainted"]
+        def run(active: PolicyRule | None) -> TierPlan:
+            return plan_tier(
+                classifier_tier=classifier_tier,
+                probabilities=outcome["probabilities"],
+                available=available,
+                rule=active,
+                last_tier=last_tier,
+                prompt_len=len(message),
+                sticky=self.sticky,
+            )
+
+        # Always compute what the model alone would have served: it is both the
+        # dry-run answer and the reference that defines whether this turn was
+        # actually intervened on.
+        baseline = run(None)
+        proposed = run(rule) if rule is not None else baseline
+        dry_run = rule is not None and rule.dry_run
+        plan = baseline if dry_run else proposed
+
+        # Taint marks a turn whose SERVED tier reflects an operator decision
+        # rather than the model's — compared on the outcome, not an intermediate,
+        # so a nudge that snap or sticky collapsed back is still trainable. It
+        # propagates through sticky: a turn held on an overridden tier was not
+        # chosen by the model either, and training on it would launder the
+        # override back in as a label one turn later.
+        tainted = plan.tier != baseline.tier or bool(
+            plan.stuck and previous is not None and previous["tainted"]
         )
+        bias_mode = ("dry_run" if dry_run else "applied") if rule is not None else ""
+        served, stuck = plan.tier, plan.stuck
         capture = outcome.get("features_b64")
 
         record = {
@@ -1150,6 +1191,10 @@ class Central:
             "featuresB64": capture,
             "rawBgeB64": outcome.get("raw_bge_b64"),
             "biasRule": rule.name if rule is not None else "",
+            "biasMode": bias_mode,
+            # What the model alone would have served. Makes a rule's real impact
+            # measurable (including in dry run, where it IS the served tier).
+            "baselineTier": baseline.tier,
             "tainted": tainted,
         }
         self.store.insert_decision(record)
@@ -1175,9 +1220,15 @@ class Central:
                 # served tier is explainable straight from the response.
                 "classifierTier": classifier_tier,
                 "stuck": stuck,
-                # Named so an operator can see WHICH rule moved a turn without
-                # opening the store; empty when the model's pick stood.
+                # Named so an operator can see WHICH rule touched a turn, in
+                # which mode, and what it would have been otherwise — without
+                # opening the store. Empty when no rule matched.
                 "biasRule": rule.name if rule is not None else "",
+                "biasMode": bias_mode,
+                "baselineTier": baseline.tier,
+                # A floor/ceiling the client's tier table cannot satisfy: the
+                # rule is impossible for this profile and is being ignored.
+                "clampUnsatisfiable": not proposed.clamp_satisfiable,
                 "tainted": tainted,
             },
         }
@@ -1261,6 +1312,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     default_tier = os.environ.get("SQUILLA_DEFAULT_TIER", "c1")
+    policy = build_policy_source()
     central = Central(
         store=MySqlStore(
             MySqlConfig(
@@ -1279,13 +1331,19 @@ def main(argv: list[str] | None = None) -> None:
                 os.environ.get("SQUILLA_STICKY_MAX_USER_LEN", STICKY_DEFAULT_MAX_USER_LEN)
             ),
         },
-        bias_rules=parse_bias_rules(os.environ.get("SQUILLA_TIER_BIAS")),
+        policy=policy,
         policy_version=os.environ.get("SQUILLA_POLICY_VERSION", "central-py-v1"),
         token=os.environ.get("SQUILLA_CENTRAL_TOKEN") or None,
     )
+    # Start the watcher only once the service is otherwise built, so a policy
+    # file problem surfaces against a running server instead of at import time.
+    policy.start()
     server = ThreadingHTTPServer((args.host, args.port), make_handler(central))
     print(f"squilla-central listening on http://{args.host}:{args.port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        policy.stop()
 
 
 def _build_classifier() -> V4Classifier | None:
